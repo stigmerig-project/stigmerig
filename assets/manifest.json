@@ -1,0 +1,20 @@
+{
+  "slug": "stigmerig-brand-avatar",
+  "concept": "StigmeRig official organization avatar - The Comb Guild (Triad)",
+  "archetype": "instrumentation",
+  "engine": "html",
+  "provenance": {
+    "generator": "html-playwright",
+    "source_script": "scripts/build_branding.py",
+    "viewport": [
+      1024,
+      1024
+    ],
+    "renderer": "chromium-playwright"
+  },
+  "timestamp": "2026-11-09T19:43:47.994488+00:00",
+  "files": {
+    "stigmerig-logo.svg": "4ae6e007fa9e97a7813628e4af5b699c2bb90a78bc069c0c52b38f45d630f2f7",
+    "stigmerig-avatar.png": "0c728d0a73695a772405f36dfd5b3033da38ccc4a67ab5eb739e94b7095788eb"
+  }
+}
