@@ -1,5 +1,6 @@
 """Hermetic unit tests for StigmeRig core state manager and CLI."""
 
+import concurrent.futures
 import datetime
 import json
 import sqlite3
@@ -107,14 +108,14 @@ def test_anti_self_approval_gate(temp_rig: StigmeRigDB):
     temp_rig.claim_task("TASK-003", agent="CoderAgent")
 
     # Attempt self-approval: verifier == implementer
-    ok, err_msg = temp_rig.complete_task(
-        task_id="TASK-003",
-        agent="CoderAgent",
-        verifier="CoderAgent",
-        allow_self_approval=False,
-    )
-    assert ok is False
-    assert "Self-approval rejected" in err_msg
+    with pytest.raises(PermissionError) as exc_info:
+        temp_rig.complete_task(
+            task_id="TASK-003",
+            agent="CoderAgent",
+            verifier="CoderAgent",
+            allow_self_approval=False,
+        )
+    assert "Self-approval forbidden" in str(exc_info.value)
 
     # Distinct verifier passes
     ok, success_msg = temp_rig.complete_task(
@@ -337,6 +338,7 @@ def test_seat_attribution_and_session_id(temp_rig: StigmeRigDB, monkeypatch):
     ok2, _ = temp_rig.complete_task(
         task_id="TSK-SEAT-2",
         agent="lead-seat:coder",
+        verifier="VerifierGamma",
         session_id="session-5678",
     )
     assert ok2 is True
@@ -390,3 +392,181 @@ def test_next_workflow_step(temp_rig: StigmeRigDB, tmp_path: Path, capsys):
     assert data["ok"] is True
     assert data["next_workflow_step"]["task_id"] == "TSK-CLI-B"
     assert data["next_workflow_step"]["archetype"] == "unit_tester"
+
+
+def test_complete_task_verifier_required_and_cli(temp_rig: StigmeRigDB, tmp_path: Path, capsys):
+    """Verify complete_task raises PermissionError without independent verifier and CLI returns 1."""
+    temp_rig.create_task("TSK-VREQ-1", "Verifier Required Task")
+    temp_rig.claim_task("TSK-VREQ-1", "DevOne")
+
+    with pytest.raises(PermissionError) as exc_info:
+        temp_rig.complete_task(
+            task_id="TSK-VREQ-1",
+            agent="DevOne",
+            verifier=None,
+            allow_self_approval=False,
+        )
+    assert "verifier is required" in str(exc_info.value).lower()
+
+    with pytest.raises(PermissionError) as exc_blank:
+        temp_rig.complete_task(
+            task_id="TSK-VREQ-1",
+            agent="DevOne",
+            verifier="   ",
+            allow_self_approval=False,
+        )
+    assert "verifier is required" in str(exc_blank.value).lower()
+
+    # Self approval bypass allowed when explicitly enabled
+    ok, _ = temp_rig.complete_task(
+        task_id="TSK-VREQ-1",
+        agent="DevOne",
+        verifier=None,
+        allow_self_approval=True,
+    )
+    assert ok is True
+
+    # CLI task done without --verifier returns 1 with verifier/self-approval message in stderr
+    rig_dir = tmp_path / "cli_vreq_rig"
+    main(["--rig-dir", str(rig_dir), "init", "--no-icm"])
+    main(["--rig-dir", str(rig_dir), "task", "create", "--id", "TSK-CLI-V", "--title", "CLI Verifier Task"])
+    main(["--rig-dir", str(rig_dir), "task", "claim", "--id", "TSK-CLI-V", "--agent", "DevCli"])
+
+    capsys.readouterr()
+    code = main([
+        "--rig-dir", str(rig_dir),
+        "task", "done",
+        "--id", "TSK-CLI-V",
+        "--agent", "DevCli",
+    ])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "verifier" in err.lower() or "self-approval" in err.lower()
+
+
+def test_priority_ascending_ordering(temp_rig: StigmeRigDB):
+    """Verify priority 10 sorts ahead of priority 100 in list_tasks and get_next_workflow_step."""
+    temp_rig.create_task("TSK-P100", "Default priority task", priority=100)
+    temp_rig.create_task("TSK-P10", "High priority task", priority=10)
+    temp_rig.create_task("TSK-P50", "Medium priority task", priority=50)
+
+    tasks = temp_rig.list_tasks(status="todo")
+    ids = [t["id"] for t in tasks]
+    assert ids == ["TSK-P10", "TSK-P50", "TSK-P100"]
+
+    # Verify in get_next_workflow_step
+    temp_rig.create_task("TSK-PARENT-1", "Parent Feature", parent_id="EPC-P", archetype="diff_synthesizer", priority=100)
+    temp_rig.create_task("TSK-CHILD-DEF", "Child default", parent_id="EPC-P", archetype="unit_tester", priority=100)
+    temp_rig.create_task("TSK-CHILD-HIGH", "Child urgent", parent_id="EPC-P", archetype="unit_tester", priority=10)
+
+    temp_rig.claim_task("TSK-PARENT-1", "DevAgent")
+    temp_rig.complete_task("TSK-PARENT-1", "DevAgent", verifier="VerifierAgent")
+
+    step = temp_rig.get_next_workflow_step("TSK-PARENT-1")
+    assert step["task_id"] == "TSK-CHILD-HIGH"
+    assert step["priority"] == 10
+
+
+def test_claim_task_reopen_and_terminal_states_and_fail_task(temp_rig: StigmeRigDB):
+    """Verify lease renewal, rejection of terminal states on claim, and fail_task KeyError."""
+    temp_rig.create_task("TSK-CLAIM-1", "Claim renewal task")
+
+    # Initial claim
+    ok = temp_rig.claim_task("TSK-CLAIM-1", agent="AgentA", ttl_seconds=300)
+    assert ok is True
+    t1 = temp_rig.get_task("TSK-CLAIM-1")
+    assert t1["status"] == "working"
+    assert t1["claimed_by"] == "AgentA"
+    assert t1["version"] == 1
+
+    # Active lease renewal by same agent
+    ok_renew = temp_rig.claim_task("TSK-CLAIM-1", agent="AgentA", ttl_seconds=600)
+    assert ok_renew is True
+    t2 = temp_rig.get_task("TSK-CLAIM-1")
+    assert t2["version"] == 2
+    assert t2["claimed_by"] == "AgentA"
+
+    # Complete task
+    ok_comp, _ = temp_rig.complete_task("TSK-CLAIM-1", agent="AgentA", verifier="VerifierB")
+    assert ok_comp is True
+    assert temp_rig.get_task("TSK-CLAIM-1")["status"] == "done"
+
+    # Cannot claim done task
+    assert temp_rig.claim_task("TSK-CLAIM-1", agent="AgentA") is False
+    assert temp_rig.claim_task("TSK-CLAIM-1", agent="AgentB") is False
+
+    # Blocked task
+    temp_rig.create_task("TSK-CLAIM-2", "Blocked task")
+    temp_rig.fail_task("TSK-CLAIM-2", agent="AgentA", reason="Blocked on external dependency")
+    assert temp_rig.get_task("TSK-CLAIM-2")["status"] == "blocked"
+
+    # Cannot claim blocked task
+    assert temp_rig.claim_task("TSK-CLAIM-2", agent="AgentA") is False
+    assert temp_rig.claim_task("TSK-CLAIM-2", agent="AgentB") is False
+
+    # fail_task raises KeyError on nonexistent task
+    with pytest.raises(KeyError) as exc_info:
+        temp_rig.fail_task("TSK-NONEXISTENT", agent="AgentA", reason="Task does not exist")
+    assert "TSK-NONEXISTENT" in str(exc_info.value)
+
+
+def test_multithreaded_log_audit_worm_integrity(temp_rig: StigmeRigDB):
+    """Verify concurrent multi-threaded audit logging maintains unbroken hash chain."""
+    num_threads = 6
+    entries_per_thread = 5
+    total_entries = num_threads * entries_per_thread
+
+    def worker(worker_id: int):
+        for j in range(entries_per_thread):
+            temp_rig.log_audit(
+                task_id=f"TSK-MT-{worker_id}",
+                action=f"action_{j}",
+                agent=f"Worker_{worker_id}",
+                verification_status="verified",
+                payload=f"thread_{worker_id}_entry_{j}",
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = [executor.submit(worker, i) for i in range(num_threads)]
+        for f in concurrent.futures.as_completed(futures):
+            f.result()
+
+    ok, msg = temp_rig.verify_audit_chain()
+    assert ok is True
+    assert f"Verified {total_entries} audit entries" in msg
+
+
+def test_cli_uninitialized_and_duplicate_error_handling(tmp_path: Path, capsys):
+    """Verify CLI task list before init and duplicate task create return 1 without unhandled crash."""
+    uninit_dir = tmp_path / "uninit_rig"
+
+    # Task list before init
+    code = main(["--rig-dir", str(uninit_dir), "task", "list"])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "[ERROR]" in err
+
+    # Initialize rig
+    init_code = main(["--rig-dir", str(uninit_dir), "init", "--no-icm"])
+    assert init_code == 0
+
+    # Create original task
+    c1 = main([
+        "--rig-dir", str(uninit_dir),
+        "task", "create",
+        "--id", "TSK-DUP-1",
+        "--title", "Original Task",
+    ])
+    assert c1 == 0
+
+    # Duplicate task create -> exit code 1
+    capsys.readouterr()
+    c2 = main([
+        "--rig-dir", str(uninit_dir),
+        "task", "create",
+        "--id", "TSK-DUP-1",
+        "--title", "Duplicate Task",
+    ])
+    assert c2 == 1
+    err2 = capsys.readouterr().err
+    assert "[ERROR]" in err2

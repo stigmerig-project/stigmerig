@@ -64,6 +64,37 @@ def derive_seat(agent: Optional[str] = None) -> str:
     return "default"
 
 
+def _is_self_approval(actor: Optional[str], verifier: Optional[str]) -> bool:
+    """Check if verifier matches actor identity or base seat/agent components."""
+    if not actor or not verifier:
+        return False
+    actor_str = str(actor).strip()
+    verifier_str = str(verifier).strip()
+    if not actor_str or not verifier_str:
+        return False
+
+    if actor_str.lower() == verifier_str.lower():
+        return True
+
+    actor_parts = set()
+    verifier_parts = set()
+    for sep in ("/", "@", ":"):
+        if sep in actor_str:
+            actor_parts.update(p.strip().lower() for p in actor_str.split(sep) if p.strip())
+        if sep in verifier_str:
+            verifier_parts.update(p.strip().lower() for p in verifier_str.split(sep) if p.strip())
+
+    if actor_parts and verifier_parts:
+        if actor_parts & verifier_parts:
+            return True
+    elif actor_parts and verifier_str.lower() in actor_parts:
+        return True
+    elif verifier_parts and actor_str.lower() in verifier_parts:
+        return True
+
+    return False
+
+
 def utc_now_iso() -> str:
     """Return current UTC time in ISO format."""
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -312,7 +343,7 @@ Add task details and acceptance criteria here.
         if parent_id:
             query += " AND parent_id = ?"
             params.append(parent_id)
-        query += " ORDER BY priority DESC, created_at ASC"
+        query += " ORDER BY priority ASC, created_at ASC"
 
         with self.get_queue_conn() as conn:
             cur = conn.cursor()
@@ -336,6 +367,10 @@ Add task details and acceptance criteria here.
         if not task:
             return False
 
+        status = task.get("status")
+        if status not in ("todo", "working"):
+            return False
+
         now_dt = datetime.datetime.now(datetime.timezone.utc)
         now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         lease_until_dt = now_dt + datetime.timedelta(seconds=ttl_seconds)
@@ -345,12 +380,16 @@ Add task details and acceptance criteria here.
         current_lease = task.get("lease_until")
         version = task.get("version", 0)
 
-        is_free = (
-            current_claimant is None
-            or current_claimant == agent
-            or (current_lease is not None and current_lease < now_str)
-        )
-        if not is_free:
+        if status == "working":
+            can_claim = (current_claimant == agent) or (current_lease is None or current_lease < now_str)
+        else:  # status == "todo"
+            can_claim = (
+                current_claimant is None
+                or current_claimant == agent
+                or (current_lease is None or current_lease < now_str)
+            )
+
+        if not can_claim:
             return False
 
         with self.get_queue_conn() as conn:
@@ -365,7 +404,13 @@ Add task details and acceptance criteria here.
                     updated_at = ?
                 WHERE id = ?
                   AND version = ?
-                  AND (claimed_by IS NULL OR claimed_by = ? OR lease_until < ?)
+                  AND status IN ('todo', 'working')
+                  AND (
+                      claimed_by = ?
+                      OR lease_until IS NULL
+                      OR lease_until < ?
+                      OR (status = 'todo' AND claimed_by IS NULL)
+                  )
                 """,
                 (agent, lease_until_str, now_str, task_id, version, agent, now_str),
             )
@@ -410,9 +455,14 @@ Add task details and acceptance criteria here.
         implementer = task.get("claimed_by") or agent
 
         # Anti-self-approval rule
-        if verifier is not None:
-            if not allow_self_approval and verifier == implementer:
-                return False, f"Self-approval rejected: verifier '{verifier}' matches implementer '{implementer}'"
+        if not allow_self_approval:
+            if verifier is None or not str(verifier).strip():
+                raise PermissionError("Independent --verifier is required unless --allow-self-approval is set.")
+            clean_verifier = str(verifier).strip()
+            if _is_self_approval(agent, clean_verifier) or _is_self_approval(task.get("claimed_by"), clean_verifier):
+                raise PermissionError(
+                    f"Self-approval forbidden: verifier '{verifier}' matches agent '{agent}' or claimant '{task.get('claimed_by')}'."
+                )
 
         now = utc_now_iso()
         seat = derive_seat(agent)
@@ -493,12 +543,12 @@ Add task details and acceptance criteria here.
         for target_arch in preferred:
             matching = [s for s in todo_siblings if s.get("archetype") == target_arch]
             if matching:
-                matching.sort(key=lambda s: (-int(s.get("priority") if s.get("priority") is not None else 100), s.get("created_at", "")))
+                matching.sort(key=lambda s: (int(s.get("priority") if s.get("priority") is not None else 100), s.get("created_at", "")))
                 selected = matching[0]
                 break
 
         if not selected:
-            todo_siblings.sort(key=lambda s: (-int(s.get("priority") if s.get("priority") is not None else 100), s.get("created_at", "")))
+            todo_siblings.sort(key=lambda s: (int(s.get("priority") if s.get("priority") is not None else 100), s.get("created_at", "")))
             selected = todo_siblings[0]
 
         return {
@@ -525,6 +575,8 @@ Add task details and acceptance criteria here.
                 """,
                 (now, task_id),
             )
+            if cur.rowcount == 0:
+                raise KeyError(f"Task '{task_id}' not found.")
             conn.execute(
                 """
                 INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
@@ -556,11 +608,17 @@ Add task details and acceptance criteria here.
         now = utc_now_iso()
         payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-        with self.get_audit_conn() as conn:
+        conn = sqlite3.connect(str(self.audit_db_path), timeout=10.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.execute("PRAGMA busy_timeout = 5000;")
+            conn.execute("BEGIN IMMEDIATE;")
             cur = conn.cursor()
             cur.execute("SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1")
             row = cur.fetchone()
-            previous_hash = row["entry_hash"] if row else "0" * 64
+            previous_hash = row["entry_hash"] if row else GENESIS_HASH
 
             raw_header = f"{now}:{task_id}:{action}:{agent}:{verification_status}:{payload_hash}:{previous_hash}"
             entry_hash = hashlib.sha256(raw_header.encode("utf-8")).hexdigest()
@@ -583,9 +641,16 @@ Add task details and acceptance criteria here.
                     entry_hash,
                 ),
             )
-            conn.commit()
-
-        return entry_hash
+            conn.execute("COMMIT;")
+            return entry_hash
+        except Exception:
+            try:
+                conn.execute("ROLLBACK;")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
 
     def verify_audit_chain(self) -> Tuple[bool, str]:
         """Validate SHA-256 link integrity across all entries in audit_log."""

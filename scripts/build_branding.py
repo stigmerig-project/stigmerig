@@ -3,7 +3,6 @@
 scripts/build_branding.py
 
 Deterministic brand asset compiler for StigmeRig.
-Complies with Code-Rendered Infographics Mandate (AGENTS.md Rule 6).
 Renders 4 bee & beehive stigmergic candidate marks into
 scratch/stigmerig-brand-candidates/ and promotes the selected mark (default: option_a)
 to assets/ with manifest.json.
@@ -12,6 +11,8 @@ to assets/ with manifest.json.
 import argparse
 import hashlib
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -378,8 +379,12 @@ def main():
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
-    workspace_root = repo_root.parent
-    scratch_dir = workspace_root / "scratch" / "stigmerig-brand-candidates"
+    scratch_dir = Path(
+        os.environ.get(
+            "STIGMERIG_BRAND_SCRATCH",
+            str(Path(tempfile.gettempdir()) / "stigmerig-brand-candidates"),
+        )
+    )
     scratch_dir.mkdir(parents=True, exist_ok=True)
 
     assets_dir = repo_root / "assets"

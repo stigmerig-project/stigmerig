@@ -7,7 +7,7 @@
 StigmeRig is a sovereign, local-first multi-agent coordination engine.
 It coordinates autonomous coding agents through environmental stigmergy without centralized cloud brokers.
 
-![StigmeRig Organization Avatar](assets/stigmerig-avatar.png)
+<p align="center"><img src="assets/stigmerig-avatar.png" alt="StigmeRig Logo" width="160" /></p>
 
 ## Intellectual Lineage and Provenance
 
@@ -59,7 +59,17 @@ StigmeRig implements controls aligned with federal and international software as
 
 ## Installation
 
-Clone the repository and install in editable development mode:
+Install StigmeRig directly from GitHub using pip or uv:
+
+```bash
+pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.1"
+```
+
+```bash
+uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.1"
+```
+
+Alternatively, clone the repository for editable local development:
 
 ```bash
 git clone https://github.com/stigmerig-project/stigmerig.git
@@ -88,7 +98,8 @@ If `AGENTS.md` already exists, it writes `.stigmerig/AGENTS.stigmerig.md` sideca
 
 ### 2. Create Tasks
 
-Register work items with priority, archetype, and tags:
+Register work items with priority, archetype, and tags.
+Priority ranks lower numbers first, so priority 10 runs before default 100:
 
 ```bash
 stigmerig task create --id TASK-001 --title "Implement feature" --archetype diff_synthesizer --priority 10

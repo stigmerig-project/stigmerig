@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
@@ -111,126 +112,138 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    db_dir = args.path if args.command == "init" and args.path else args.rig_dir
-    rig = StigmeRigDB(rig_dir=db_dir)
+    try:
+        db_dir = args.path if args.command == "init" and args.path else args.rig_dir
+        rig = StigmeRigDB(rig_dir=db_dir)
 
-    if args.command == "init":
-        hint = rig.init_rig(scaffold_icm=not getattr(args, "no_icm", False))
-        print(f"Initialized StigmeRig in {rig.rig_dir}")
-        if hint:
-            print(hint)
-        return 0
-
-    if args.command == "task":
-        if args.subcommand == "create":
-            task = rig.create_task(
-                task_id=args.id,
-                title=args.title,
-                parent_id=args.parent,
-                tags=args.tags,
-                author=args.author,
-                archetype=args.archetype,
-                priority=args.priority,
-            )
-            print(json.dumps(task, indent=2))
+        if args.command == "init":
+            hint = rig.init_rig(scaffold_icm=not getattr(args, "no_icm", False))
+            print(f"Initialized StigmeRig in {rig.rig_dir}")
+            if hint:
+                print(hint)
             return 0
 
-        if args.subcommand == "list":
-            tasks = rig.list_tasks(status=args.status, parent_id=args.parent)
-            print(json.dumps(tasks, indent=2))
-            return 0
+        if args.command == "task":
+            if args.subcommand == "create":
+                task = rig.create_task(
+                    task_id=args.id,
+                    title=args.title,
+                    parent_id=args.parent,
+                    tags=args.tags,
+                    author=args.author,
+                    archetype=args.archetype,
+                    priority=args.priority,
+                )
+                print(json.dumps(task, indent=2))
+                return 0
 
-        if args.subcommand == "get":
-            task = rig.get_task(args.id)
-            if not task:
-                print(f"Task {args.id} not found", file=sys.stderr)
+            if args.subcommand == "list":
+                tasks = rig.list_tasks(status=args.status, parent_id=args.parent)
+                print(json.dumps(tasks, indent=2))
+                return 0
+
+            if args.subcommand == "get":
+                task = rig.get_task(args.id)
+                if not task:
+                    print(f"Task {args.id} not found", file=sys.stderr)
+                    return 1
+                print(json.dumps(task, indent=2))
+                return 0
+
+            if args.subcommand == "claim":
+                ok = rig.claim_task(task_id=args.id, agent=args.agent, ttl_seconds=args.ttl)
+                if ok:
+                    print(f"Task {args.id} claimed by {args.agent}")
+                    return 0
+                print(f"Failed to claim task {args.id} (already held or version conflict)", file=sys.stderr)
                 return 1
-            print(json.dumps(task, indent=2))
-            return 0
 
-        if args.subcommand == "claim":
-            ok = rig.claim_task(task_id=args.id, agent=args.agent, ttl_seconds=args.ttl)
-            if ok:
-                print(f"Task {args.id} claimed by {args.agent}")
+            if args.subcommand == "done":
+                ok, msg = rig.complete_task(
+                    task_id=args.id,
+                    agent=args.agent,
+                    verifier=args.verifier,
+                    allow_self_approval=args.allow_self_approval,
+                    session_id=getattr(args, "session_id", None),
+                )
+                if ok:
+                    next_step = rig.get_next_workflow_step(args.id)
+                    res = {
+                        "ok": True,
+                        "task_id": args.id,
+                        "message": msg,
+                        "next_workflow_step": next_step,
+                    }
+                    print(json.dumps(res, indent=2))
+                    return 0
+                print(f"Failed to complete task {args.id}: {msg}", file=sys.stderr)
+                return 1
+
+            if args.subcommand == "fail":
+                ok = rig.fail_task(task_id=args.id, agent=args.agent, reason=args.reason)
+                if ok:
+                    print(f"Task {args.id} marked blocked: {args.reason}")
+                    return 0
+                return 1
+
+        if args.command == "audit":
+            if args.subcommand == "log":
+                entry_hash = rig.log_audit(
+                    task_id=args.task,
+                    action=args.action,
+                    agent=args.agent,
+                    verification_status=args.status,
+                    payload=args.payload,
+                )
+                print(f"Logged audit entry: {entry_hash}")
                 return 0
-            print(f"Failed to claim task {args.id} (already held or version conflict)", file=sys.stderr)
-            return 1
 
-        if args.subcommand == "done":
-            ok, msg = rig.complete_task(
-                task_id=args.id,
-                agent=args.agent,
-                verifier=args.verifier,
-                allow_self_approval=args.allow_self_approval,
-                session_id=getattr(args, "session_id", None),
-            )
-            if ok:
-                next_step = rig.get_next_workflow_step(args.id)
-                res = {
-                    "ok": True,
-                    "task_id": args.id,
-                    "message": msg,
-                    "next_workflow_step": next_step,
-                }
-                print(json.dumps(res, indent=2))
+            if args.subcommand == "verify":
+                ok, msg = rig.verify_audit_chain()
+                if ok:
+                    print(f"Audit verification PASSED: {msg}")
+                    return 0
+                print(f"Audit verification FAILED: {msg}", file=sys.stderr)
+                return 1
+
+        if args.command == "board":
+            if args.subcommand == "sync":
+                path = rig.sync_board()
+                print(f"Board synchronized: {path}")
                 return 0
-            print(f"Failed to complete task {args.id}: {msg}", file=sys.stderr)
-            return 1
 
-        if args.subcommand == "fail":
-            ok = rig.fail_task(task_id=args.id, agent=args.agent, reason=args.reason)
-            if ok:
-                print(f"Task {args.id} marked blocked: {args.reason}")
+        if args.command == "telemetry":
+            from stigmerig.telemetry import TelemetryExporter
+            exporter = TelemetryExporter(rig)
+            if args.subcommand == "sequence":
+                diag = exporter.generate_mermaid_sequence(task_id=args.task)
+                if args.output:
+                    Path(args.output).write_text(diag, encoding="utf-8")
+                    print(f"Wrote sequence diagram to {args.output}")
+                else:
+                    print(diag)
                 return 0
-            return 1
-
-    if args.command == "audit":
-        if args.subcommand == "log":
-            entry_hash = rig.log_audit(
-                task_id=args.task,
-                action=args.action,
-                agent=args.agent,
-                verification_status=args.status,
-                payload=args.payload,
-            )
-            print(f"Logged audit entry: {entry_hash}")
-            return 0
-
-        if args.subcommand == "verify":
-            ok, msg = rig.verify_audit_chain()
-            if ok:
-                print(f"Audit verification PASSED: {msg}")
+            if args.subcommand == "metrics":
+                tbl = exporter.generate_metrics_markdown()
+                if args.output:
+                    Path(args.output).write_text(tbl, encoding="utf-8")
+                    print(f"Wrote metrics table to {args.output}")
+                else:
+                    print(tbl)
                 return 0
-            print(f"Audit verification FAILED: {msg}", file=sys.stderr)
-            return 1
 
-    if args.command == "board":
-        if args.subcommand == "sync":
-            path = rig.sync_board()
-            print(f"Board synchronized: {path}")
-            return 0
-
-    if args.command == "telemetry":
-        from stigmerig.telemetry import TelemetryExporter
-        exporter = TelemetryExporter(rig)
-        if args.subcommand == "sequence":
-            diag = exporter.generate_mermaid_sequence(task_id=args.task)
-            if args.output:
-                Path(args.output).write_text(diag, encoding="utf-8")
-                print(f"Wrote sequence diagram to {args.output}")
-            else:
-                print(diag)
-            return 0
-        if args.subcommand == "metrics":
-            tbl = exporter.generate_metrics_markdown()
-            if args.output:
-                Path(args.output).write_text(tbl, encoding="utf-8")
-                print(f"Wrote metrics table to {args.output}")
-            else:
-                print(tbl)
-            return 0
-
-    return 0
+        return 0
+    except (
+        PermissionError,
+        KeyError,
+        ValueError,
+        FileNotFoundError,
+        sqlite3.OperationalError,
+        sqlite3.IntegrityError,
+    ) as exc:
+        err_msg = exc.args[0] if exc.args else str(exc)
+        print(f"[ERROR] {err_msg}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

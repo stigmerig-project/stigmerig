@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -61,13 +62,37 @@ class TelemetryExporter:
             except Exception:
                 pass
 
+        actor_map: Dict[str, str] = {}
+        used_ids: set[str] = set()
+
         for p in participants:
-            lines.append(f"    actor {p}")
+            if re.fullmatch(r"[A-Za-z0-9_]+", p):
+                safe_id = p
+                if safe_id in used_ids:
+                    counter = 1
+                    while f"{safe_id}_{counter}" in used_ids:
+                        counter += 1
+                    safe_id = f"{safe_id}_{counter}"
+                actor_map[p] = safe_id
+                used_ids.add(safe_id)
+                lines.append(f"    actor {safe_id}")
+            else:
+                base = re.sub(r"[^A-Za-z0-9_]", "_", p).strip("_") or "actor"
+                safe_id = base
+                counter = 1
+                while safe_id in used_ids:
+                    safe_id = f"{base}_{counter}"
+                    counter += 1
+                used_ids.add(safe_id)
+                actor_map[p] = safe_id
+                lines.append(f'    actor {safe_id} as "{p}"')
 
         for ev in events:
             t_id = ev["task_id"]
             e_type = ev["event_type"]
             agent = ev.get("agent") or "System"
+            agent_id = actor_map.get(agent, agent)
+            sys_id = actor_map.get("System", "System")
             payload_str = ev.get("payload") or "{}"
             try:
                 payload = json.loads(payload_str)
@@ -75,21 +100,22 @@ class TelemetryExporter:
                 payload = {}
 
             if e_type == "created":
-                lines.append(f"    System->>{agent}: Create {t_id}")
+                lines.append(f"    {sys_id}->>{agent_id}: Create {t_id}")
             elif e_type == "claimed":
-                lines.append(f"    {agent}->>System: Claim lease for {t_id}")
+                lines.append(f"    {agent_id}->>{sys_id}: Claim lease for {t_id}")
             elif e_type == "completed":
                 verifier = payload.get("verifier")
                 if verifier and verifier != agent:
-                    lines.append(f"    {agent}->>{verifier}: Submit {t_id} for review")
-                    lines.append(f"    {verifier}->>System: Verified {t_id}")
+                    verifier_id = actor_map.get(verifier, verifier)
+                    lines.append(f"    {agent_id}->>{verifier_id}: Submit {t_id} for review")
+                    lines.append(f"    {verifier_id}->>{sys_id}: Verified {t_id}")
                 else:
-                    lines.append(f"    {agent}->>System: Completed {t_id}")
+                    lines.append(f"    {agent_id}->>{sys_id}: Completed {t_id}")
             elif e_type == "blocked":
                 reason = payload.get("reason", "unknown")
-                lines.append(f"    {agent}->>System: Report blocked {t_id} ({reason})")
+                lines.append(f"    {agent_id}->>{sys_id}: Report blocked {t_id} ({reason})")
             else:
-                lines.append(f"    {agent}->>System: {e_type} {t_id}")
+                lines.append(f"    {agent_id}->>{sys_id}: {e_type} {t_id}")
 
         return "\n".join(lines) + "\n"
 

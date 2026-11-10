@@ -184,3 +184,184 @@ def test_swarm_name_parameterization(git_repo: Path, monkeypatch):
     assert "Custom Swarm [diff_synthesizer] <swarm+diff_synthesizer@customswarm.local>" in log
     assert "Custom Swarm [orchestrator] <swarm+orchestrator@customswarm.local>" in log
 
+
+def test_wave_runner_seven_tasks_batching(git_repo: Path):
+    """Verify run_wave with 7 task specs and max_concurrency=3 completes all 7 tasks."""
+    rig_dir = git_repo / ".stigmerig"
+    db = StigmeRigDB(rig_dir=rig_dir)
+    db.init_rig()
+
+    wt_mgr = WorktreeManager(repo_root=git_repo)
+    runner = WaveRunner(db=db, worktree_mgr=wt_mgr)
+
+    for i in range(1, 8):
+        db.create_task(
+            task_id=f"TSK-WAVE7-{i}",
+            title=f"Wave 7 task {i}",
+            parent_id="EPC-TEST",
+            author="Architect",
+        )
+
+    def make_action(task_num: int):
+        def action_fn(worktree_dir: Path) -> bool:
+            f = worktree_dir / f"output_wave7_{task_num}.txt"
+            f.write_text(f"Task {task_num} output", encoding="utf-8")
+            return True
+        return action_fn
+
+    task_specs = [
+        {
+            "task_id": f"TSK-WAVE7-{i}",
+            "agent": f"Agent{i}",
+            "verifier": f"Agent{(i % 7) + 1}",
+            "action": make_action(i),
+        }
+        for i in range(1, 8)
+    ]
+
+    results = runner.run_wave(task_specs, max_concurrency=3)
+    assert len(results) == 7
+    for t_id, (ok, msg) in results.items():
+        assert ok is True, f"Task {t_id} failed: {msg}"
+
+    for i in range(1, 8):
+        assert (git_repo / f"output_wave7_{i}.txt").exists()
+        task = db.get_task(f"TSK-WAVE7-{i}")
+        assert task is not None
+        assert task["status"] == "done"
+
+
+def test_verify_only_clean_tree_task(git_repo: Path):
+    """Verify verify-only action_fn completing cleanly with status == 'done' and worktree cleaned up."""
+    rig_dir = git_repo / ".stigmerig"
+    db = StigmeRigDB(rig_dir=rig_dir)
+    db.init_rig()
+
+    wt_mgr = WorktreeManager(repo_root=git_repo)
+    runner = WaveRunner(db=db, worktree_mgr=wt_mgr)
+
+    db.create_task(task_id="TSK-VONLY-1", title="Verify only task", author="Architect")
+
+    def verify_action(worktree_dir: Path) -> bool:
+        readme = worktree_dir / "README.md"
+        assert readme.exists()
+        return True
+
+    wt_path = wt_mgr.worktrees_dir / "TSK-VONLY-1"
+
+    ok, msg = runner.run_task_in_worktree(
+        task_id="TSK-VONLY-1",
+        agent="AuditorAgent",
+        action_fn=verify_action,
+        verifier="VerifierAgent",
+    )
+
+    assert ok is True, f"Verify-only task failed: {msg}"
+    assert not wt_path.exists()
+    task = db.get_task("TSK-VONLY-1")
+    assert task is not None
+    assert task["status"] == "done"
+
+
+def test_independent_verifier_contract_enforced(git_repo: Path):
+    """Verify run_wave / run_task_in_worktree rejecting missing verifier or verifier == agent."""
+    rig_dir = git_repo / ".stigmerig"
+    db = StigmeRigDB(rig_dir=rig_dir)
+    db.init_rig()
+
+    wt_mgr = WorktreeManager(repo_root=git_repo)
+    runner = WaveRunner(db=db, worktree_mgr=wt_mgr)
+
+    # 1. Missing verifier (None)
+    db.create_task(task_id="TSK-REJ-1", title="Missing verifier", author="Architect")
+    ok, msg = runner.run_task_in_worktree(
+        task_id="TSK-REJ-1",
+        agent="WorkerAgent",
+        action_fn=lambda p: True,
+        verifier=None,
+        allow_self_approval=False,
+    )
+    assert ok is False
+    assert "Independent verifier required unless allow_self_approval is True" in msg
+    task1 = db.get_task("TSK-REJ-1")
+    assert task1["status"] == "todo"
+
+    # 2. Empty string verifier
+    db.create_task(task_id="TSK-REJ-2", title="Empty verifier", author="Architect")
+    ok, msg = runner.run_task_in_worktree(
+        task_id="TSK-REJ-2",
+        agent="WorkerAgent",
+        action_fn=lambda p: True,
+        verifier="   ",
+        allow_self_approval=False,
+    )
+    assert ok is False
+    assert "Independent verifier required unless allow_self_approval is True" in msg
+
+    # 3. Verifier equals agent (self-verification)
+    db.create_task(task_id="TSK-REJ-3", title="Self verification", author="Architect")
+    ok, msg = runner.run_task_in_worktree(
+        task_id="TSK-REJ-3",
+        agent="WorkerAgent",
+        action_fn=lambda p: True,
+        verifier="WorkerAgent",
+        allow_self_approval=False,
+    )
+    assert ok is False
+    assert "Independent verifier required unless allow_self_approval is True" in msg
+    task3 = db.get_task("TSK-REJ-3")
+    assert task3["status"] == "todo"
+
+    # 4. run_wave rejects invalid verifier
+    db.create_task(task_id="TSK-REJ-4", title="Wave self-approval reject", author="Architect")
+    wave_results = runner.run_wave([
+        {
+            "task_id": "TSK-REJ-4",
+            "agent": "WorkerAgent",
+            "verifier": "WorkerAgent",
+            "action": lambda p: True,
+            "allow_self_approval": False,
+        }
+    ])
+    assert wave_results["TSK-REJ-4"][0] is False
+    assert "Independent verifier required" in wave_results["TSK-REJ-4"][1]
+
+    # 5. Permitted when allow_self_approval=True
+    db.create_task(task_id="TSK-OK-SELF", title="Self approval allowed", author="Architect")
+    ok, msg = runner.run_task_in_worktree(
+        task_id="TSK-OK-SELF",
+        agent="SoloAgent",
+        action_fn=lambda p: True,
+        verifier="SoloAgent",
+        allow_self_approval=True,
+    )
+    assert ok is True, f"Permitted self-approval failed: {msg}"
+    task_ok = db.get_task("TSK-OK-SELF")
+    assert task_ok["status"] == "done"
+
+
+def test_telemetry_safe_mermaid_actor_aliasing(git_repo: Path):
+    """Verify special characters like colons and hyphens in actor names are safely aliased in Mermaid."""
+    rig_dir = git_repo / ".stigmerig"
+    db = StigmeRigDB(rig_dir=rig_dir)
+    db.init_rig()
+
+    db.create_task(task_id="TSK-SPEC-1", title="Special actors", author="lead-seat:coder")
+    db.claim_task(task_id="TSK-SPEC-1", agent="lead-seat:coder")
+    db.complete_task(
+        task_id="TSK-SPEC-1",
+        agent="lead-seat:coder",
+        verifier="claude-code",
+        allow_self_approval=False,
+    )
+
+    exporter = TelemetryExporter(db)
+    seq = exporter.generate_mermaid_sequence(task_id="TSK-SPEC-1")
+
+    assert 'actor lead_seat_coder as "lead-seat:coder"' in seq
+    assert 'actor claude_code as "claude-code"' in seq
+    assert "lead_seat_coder->>claude_code: Submit TSK-SPEC-1 for review" in seq
+    assert "claude_code->>System: Verified TSK-SPEC-1" in seq
+    assert "lead-seat:coder->>" not in seq
+    assert "claude-code->>" not in seq
+

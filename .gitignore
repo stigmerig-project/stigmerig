@@ -25,8 +25,11 @@ htmlcov/
 .ruff_cache/
 
 # Worktrees & local runtime databases
+.stigmerig/
 .worktrees/
 *.db
+*.db-wal
+*.db-shm
 *.db-journal
 *.sqlite
 *.sqlite3

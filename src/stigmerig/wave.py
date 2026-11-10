@@ -121,6 +121,20 @@ class WorktreeManager:
         branch_name = f"task/{clean_id}"
         target = target_branch or get_active_branch(self.repo_root)
 
+        # Check clean worktree first
+        worktree_path = self.worktrees_dir / clean_id
+        if worktree_path.exists():
+            status_res = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(worktree_path),
+                capture_output=True,
+                text=True,
+            )
+            if status_res.returncode != 0:
+                return False, f"Failed to check git status in worktree {worktree_path}: {status_res.stderr.strip()}"
+            if status_res.stdout.strip():
+                return False, f"Worktree at {worktree_path} has uncommitted changes"
+
         # Ensure we are on target branch
         active = get_active_branch(self.repo_root)
         if active != target:
@@ -183,8 +197,13 @@ class WaveRunner:
         action_fn: Callable[[Path], bool],
         verifier: Optional[str] = None,
         archetype: Optional[str] = None,
+        allow_self_approval: bool = False,
     ) -> Tuple[bool, str]:
         """Execute a single task inside an isolated worktree."""
+        if not allow_self_approval:
+            if not (verifier and str(verifier).strip()) or verifier == agent:
+                return False, "Independent verifier required unless allow_self_approval is True"
+
         claimed = self.db.claim_task(task_id, agent=agent)
         if not claimed:
             return False, f"Could not claim task {task_id} for {agent}"
@@ -209,42 +228,51 @@ class WaveRunner:
             if self.worktree_mgr and worktree_path:
                 # Commit any changes made inside worktree attributing to specific swarm archetype
                 subprocess.run(["git", "add", "."], cwd=str(worktree_path), capture_output=True, check=True)
-                swarm_name = self.swarm_name
-                swarm_slug = re.sub(r"[^a-zA-Z0-9]", "", swarm_name.lower()) or "stigmerig"
-                clean_arch = arch.lower().replace(" ", "_")
-                author_name = f"{swarm_name} [{arch}]"
-                author_email = f"swarm+{clean_arch}@{swarm_slug}.local"
-
-                env = {
-                    **os.environ,
-                    "GIT_AUTHOR_NAME": author_name,
-                    "GIT_AUTHOR_EMAIL": author_email,
-                    "GIT_COMMITTER_NAME": f"{swarm_name} [orchestrator]",
-                    "GIT_COMMITTER_EMAIL": f"swarm+orchestrator@{swarm_slug}.local",
-                }
-                commit_msg = (
-                    f"feat({task_id}): {task_title}\n\n"
-                    f"Archetype: {arch}\n"
-                    f"Claimant: {agent}\n"
-                    f"Verifier: {verifier or 'independent'}\n"
-                    f"Task-ID: {task_id}\n"
-                )
-                subprocess.run(
-                    ["git", "commit", "-m", commit_msg],
+                diff_proc = subprocess.run(
+                    ["git", "diff", "--cached", "--quiet"],
                     cwd=str(worktree_path),
-                    env=env,
                     capture_output=True,
-                    check=True,
                 )
-                merged, msg = self.worktree_mgr.merge_worktree(task_id)
-                if not merged:
-                    self.db.fail_task(task_id, agent=agent, reason=f"Merge failed: {msg}")
-                    return False, f"Merge failed: {msg}"
+                if diff_proc.returncode == 0:
+                    self.worktree_mgr.remove_worktree(task_id)
+                else:
+                    swarm_name = self.swarm_name
+                    swarm_slug = re.sub(r"[^a-zA-Z0-9]", "", swarm_name.lower()) or "stigmerig"
+                    clean_arch = arch.lower().replace(" ", "_")
+                    author_name = f"{swarm_name} [{arch}]"
+                    author_email = f"swarm+{clean_arch}@{swarm_slug}.local"
+
+                    env = {
+                        **os.environ,
+                        "GIT_AUTHOR_NAME": author_name,
+                        "GIT_AUTHOR_EMAIL": author_email,
+                        "GIT_COMMITTER_NAME": f"{swarm_name} [orchestrator]",
+                        "GIT_COMMITTER_EMAIL": f"swarm+orchestrator@{swarm_slug}.local",
+                    }
+                    commit_msg = (
+                        f"feat({task_id}): {task_title}\n\n"
+                        f"Archetype: {arch}\n"
+                        f"Claimant: {agent}\n"
+                        f"Verifier: {verifier or 'independent'}\n"
+                        f"Task-ID: {task_id}\n"
+                    )
+                    subprocess.run(
+                        ["git", "commit", "-m", commit_msg],
+                        cwd=str(worktree_path),
+                        env=env,
+                        capture_output=True,
+                        check=True,
+                    )
+                    merged, msg = self.worktree_mgr.merge_worktree(task_id)
+                    if not merged:
+                        self.db.fail_task(task_id, agent=agent, reason=f"Merge failed: {msg}")
+                        return False, f"Merge failed: {msg}"
 
             ok, comp_msg = self.db.complete_task(
                 task_id=task_id,
                 agent=agent,
                 verifier=verifier,
+                allow_self_approval=allow_self_approval,
             )
             return ok, comp_msg
         except Exception as exc:
@@ -260,22 +288,26 @@ class WaveRunner:
     ) -> Dict[str, Tuple[bool, str]]:
         """Run a wave of tasks. Limit concurrency to 3 to 5 tasks per wave."""
         results: Dict[str, Tuple[bool, str]] = {}
-        wave_batch = task_specs[:max_concurrency]
+        batch_size = max(1, min(int(max_concurrency), 5))
 
-        for spec in wave_batch:
-            t_id = spec["task_id"]
-            agent = spec["agent"]
-            action_fn = spec["action"]
-            verifier = spec.get("verifier")
-            arch = spec.get("archetype")
+        for idx in range(0, len(task_specs), batch_size):
+            batch = task_specs[idx : idx + batch_size]
+            for spec in batch:
+                t_id = spec["task_id"]
+                agent = spec["agent"]
+                action_fn = spec["action"]
+                verifier = spec.get("verifier")
+                arch = spec.get("archetype")
+                allow_self_approval = spec.get("allow_self_approval", False)
 
-            ok, msg = self.run_task_in_worktree(
-                task_id=t_id,
-                agent=agent,
-                action_fn=action_fn,
-                verifier=verifier,
-                archetype=arch,
-            )
-            results[t_id] = (ok, msg)
+                ok, msg = self.run_task_in_worktree(
+                    task_id=t_id,
+                    agent=agent,
+                    action_fn=action_fn,
+                    verifier=verifier,
+                    archetype=arch,
+                    allow_self_approval=allow_self_approval,
+                )
+                results[t_id] = (ok, msg)
 
         return results
