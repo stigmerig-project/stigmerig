@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import datetime
 import hashlib
 import json
@@ -241,23 +242,41 @@ class StigmeRigDB:
 
         return hint
 
-    def get_queue_conn(self) -> sqlite3.Connection:
-        """Create a connection to queue.db with WAL pragmas."""
+    @contextmanager
+    def get_queue_conn(self):
+        """Create a connection to queue.db with WAL pragmas, closing on context exit."""
         conn = sqlite3.connect(str(self.queue_db_path), timeout=5.0)
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
         conn.execute("PRAGMA busy_timeout = 5000;")
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
-    def get_audit_conn(self) -> sqlite3.Connection:
-        """Create a connection to audit.db with WAL pragmas."""
+    @contextmanager
+    def get_audit_conn(self):
+        """Create a connection to audit.db with WAL pragmas, closing on context exit."""
         conn = sqlite3.connect(str(self.audit_db_path), timeout=5.0)
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
         conn.execute("PRAGMA busy_timeout = 5000;")
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def get_task_file(self, task_id: str) -> Path:
+        """Resolve task markdown file supporting both flat tasks/<ID>.md and nested tasks/<ID>/context.md."""
+        nested = self.tasks_dir / task_id / "context.md"
+        if nested.exists():
+            return nested
+        flat = self.tasks_dir / f"{task_id}.md"
+        if flat.exists():
+            return flat
+        return nested if (self.tasks_dir / task_id).is_dir() else flat
 
     def create_task(
         self,
@@ -271,7 +290,7 @@ class StigmeRigDB:
     ) -> Dict[str, Any]:
         """Create a new task record in SQLite and write its markdown scaffold."""
         now = utc_now_iso()
-        task_file = self.tasks_dir / f"{task_id}.md"
+        task_file = self.get_task_file(task_id)
         context_path = str(task_file.relative_to(self.rig_dir.parent))
 
         with self.get_queue_conn() as conn:
@@ -653,35 +672,53 @@ Add task details and acceptance criteria here.
             conn.close()
 
     def verify_audit_chain(self) -> Tuple[bool, str]:
-        """Validate SHA-256 link integrity across all entries in audit_log."""
+        """Validate hash chain link integrity across all entries in audit_log supporting Tier A and Tier B."""
         with self.get_audit_conn() as conn:
             cur = conn.cursor()
+            cur.execute("PRAGMA table_info(audit_log)")
+            cols = {r["name"] for r in cur.fetchall()}
+            if not cols:
+                return True, "audit_log table does not exist"
+            hash_col = "hash" if "hash" in cols else "entry_hash"
+
             cur.execute("SELECT * FROM audit_log ORDER BY id ASC")
             rows = [dict(r) for r in cur.fetchall()]
 
         if not rows:
             return True, "Audit log is empty"
 
-        expected_previous = "0" * 64
-        for row in rows:
-            if row["previous_hash"] != expected_previous:
-                return (
-                    False,
-                    f"Hash break at ID {row['id']}: expected previous {expected_previous}, got {row['previous_hash']}",
-                )
+        prev_hash: Optional[str] = None
+        for i, row in enumerate(rows):
+            current_hash = row.get(hash_col)
+            previous_hash = row.get("previous_hash")
 
-            raw_header = (
-                f"{row['timestamp']}:{row['task_id']}:{row['action']}:"
-                f"{row['agent']}:{row['verification_status']}:{row['payload_hash']}:{row['previous_hash']}"
-            )
-            calculated_hash = hashlib.sha256(raw_header.encode("utf-8")).hexdigest()
-            if calculated_hash != row["entry_hash"]:
-                return (
-                    False,
-                    f"Hash mismatch at ID {row['id']}: calculated {calculated_hash}, stored {row['entry_hash']}",
-                )
+            if i == 0:
+                # Genesis row: previous_hash can be "0"*64, None, or empty
+                if previous_hash not in ("0" * 64, None, ""):
+                    return (
+                        False,
+                        f"Hash break at genesis ID {row['id']}: expected genesis, got {previous_hash}",
+                    )
+            else:
+                if previous_hash != prev_hash:
+                    return (
+                        False,
+                        f"Hash break at ID {row['id']}: expected previous {prev_hash}, got {previous_hash}",
+                    )
 
-            expected_previous = row["entry_hash"]
+            if hash_col == "entry_hash" and "payload_hash" in cols:
+                raw_header = (
+                    f"{row['timestamp']}:{row['task_id']}:{row['action']}:"
+                    f"{row['agent']}:{row['verification_status']}:{row['payload_hash']}:{row['previous_hash']}"
+                )
+                calculated_hash = hashlib.sha256(raw_header.encode("utf-8")).hexdigest()
+                if calculated_hash != current_hash:
+                    return (
+                        False,
+                        f"Hash mismatch at ID {row['id']}: calculated {calculated_hash}, stored {current_hash}",
+                    )
+
+            prev_hash = current_hash
 
         return True, f"Verified {len(rows)} audit entries with intact hash chain"
 

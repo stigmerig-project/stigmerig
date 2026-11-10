@@ -26,18 +26,35 @@ class TelemetryExporter:
         self.db = db
 
     def get_events(self, task_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Fetch chronological task events from queue.db."""
-        query = "SELECT * FROM task_events"
+        """Fetch chronological task events from queue.db supporting both Tier A and Tier B schemas."""
         params: List[Any] = []
+        where_clause = ""
         if task_id:
-            query += " WHERE task_id = ?"
+            where_clause = " WHERE task_id = ?"
             params.append(task_id)
-        query += " ORDER BY id ASC"
 
         with self.db.get_queue_conn() as conn:
             cur = conn.cursor()
+            cur.execute("PRAGMA table_info(task_events)")
+            cols = {r["name"] for r in cur.fetchall()}
+            order_col = "id" if "id" in cols else ("event_id" if "event_id" in cols else "rowid")
+            query = f"SELECT * FROM task_events{where_clause} ORDER BY {order_col} ASC"
             cur.execute(query, params)
-            return [dict(r) for r in cur.fetchall()]
+            raw_rows = [dict(r) for r in cur.fetchall()]
+
+        norm_rows: List[Dict[str, Any]] = []
+        for r in raw_rows:
+            norm = dict(r)
+            if "id" not in norm and "event_id" in norm:
+                norm["id"] = norm["event_id"]
+            if "agent" not in norm and "actor" in norm:
+                norm["agent"] = norm["actor"]
+            if "payload" not in norm and "message" in norm:
+                norm["payload"] = norm["message"]
+            if "timestamp" not in norm and "created_at" in norm:
+                norm["timestamp"] = norm["created_at"]
+            norm_rows.append(norm)
+        return norm_rows
 
     def generate_mermaid_sequence(self, task_id: Optional[str] = None) -> str:
         """Render a Mermaid sequence diagram visualizing agent handoffs."""

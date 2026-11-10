@@ -1,3 +1,3 @@
 """StigmeRig: Sovereign, local-first multi-agent stigmergy coordination engine."""
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

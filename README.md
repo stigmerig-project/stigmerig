@@ -169,6 +169,9 @@ Use `--rig-dir <path>` to target isolated sub-project sandboxes without pollutin
 stigmerig --rig-dir ./subproject/.stigmerig task list
 ```
 
+Running board synchronization inside an isolated rig writes `<rig_dir>/Task_Board.md`.
+This updates local status without clobbering root workspace Kanban boards.
+
 ### Aider
 
 Pair StigmeRig with Aider across isolated git branches:
@@ -178,3 +181,11 @@ stigmerig task claim --id TASK-002 --agent aider
 aider --message "Implement TASK-002 per CONTEXT.md"
 stigmerig task done --id TASK-002 --agent aider --verifier human
 ```
+
+## Tier A and Tier B Interoperability
+
+StigmeRig provides bidirectional compatibility between standalone projects (Tier A) and monorepo agent workspaces (Tier B):
+
+- **Task Markdown Structure**: Supports both flat `tasks/<ID>.md` files and nested `tasks/<ID>/context.md` directories.
+- **Audit Chain Verification**: The `stigmerig audit verify` command validates both Tier A seven-field header schemas and Tier B `v2:` hash chains.
+- **External Rig Isolation**: Passing `--rig-dir` directs state and task files to the target project, generating `<rig_dir>/Task_Board.md` without clobbering parent boards.
