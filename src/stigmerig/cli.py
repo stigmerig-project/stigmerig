@@ -101,8 +101,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_tseq = telem_sub.add_parser("sequence", help="Generate Mermaid sequence diagram")
     p_tseq.add_argument("--task", default=None, help="Filter sequence by task ID")
     p_tseq.add_argument("--output", default=None, help="Output file path (prints to stdout if omitted)")
-    p_tmet = telem_sub.add_parser("metrics", help="Generate task duration metrics markdown")
+    p_tmet = telem_sub.add_parser("metrics", help="Generate task duration metrics markdown or JSON")
     p_tmet.add_argument("--output", default=None, help="Output file path")
+    p_tmet.add_argument("--json", action="store_true", help="Emit structured JSON metrics instead of markdown")
 
     return parser
 
@@ -224,6 +225,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     print(diag)
                 return 0
             if args.subcommand == "metrics":
+                if getattr(args, "json", False):
+                    payload = json.dumps(exporter.export_metrics_json(), indent=2)
+                    if args.output:
+                        Path(args.output).write_text(payload + "\n", encoding="utf-8")
+                        print(f"Wrote metrics JSON to {args.output}")
+                    else:
+                        print(payload)
+                    return 0
                 tbl = exporter.generate_metrics_markdown()
                 if args.output:
                     Path(args.output).write_text(tbl, encoding="utf-8")

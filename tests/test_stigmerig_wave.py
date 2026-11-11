@@ -1,5 +1,6 @@
 """Unit tests for StigmeRig git worktree manager, wave runner, and telemetry."""
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -364,4 +365,175 @@ def test_telemetry_safe_mermaid_actor_aliasing(git_repo: Path):
     assert "claude_code->>System: Verified TSK-SPEC-1" in seq
     assert "lead-seat:coder->>" not in seq
     assert "claude-code->>" not in seq
+
+
+def test_tier_a_uppercase_event_normalization(tmp_path: Path):
+    """Verify Tier A uppercase task_events normalize cleanly while preserving raw_event_type."""
+    rig_dir = tmp_path / ".stigmerig"
+    db = StigmeRigDB(rig_dir=rig_dir)
+    db.init_rig(scaffold_icm=False)
+
+    with db.get_queue_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO tasks (id, title, status, priority, created_at, updated_at, parent_id, archetype)
+            VALUES
+                ('EPIC-LIN', 'Linear coordination epic', 'done', 100, '2026-01-01T10:00:00Z', '2026-01-01T10:15:00Z', NULL, 'diff_synthesizer'),
+                ('TASK-LIN-1', 'First task', 'done', 100, '2026-01-01T10:00:00Z', '2026-01-01T10:05:00Z', 'EPIC-LIN', 'diff_synthesizer'),
+                ('TASK-LIN-2', 'Second task', 'blocked', 100, '2026-01-01T10:06:00Z', '2026-01-01T10:10:00Z', 'EPIC-LIN', 'unit_tester')
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                ("TASK-LIN-1", "AGENT CREATED", "PlannerAgent", "{}", "2026-01-01T10:00:00Z"),
+                ("TASK-LIN-1", "AGENT CLAIMED", "BuilderAgent", "{}", "2026-01-01T10:01:00Z"),
+                ("TASK-LIN-1", "AGENT WORKING", "BuilderAgent", "{}", "2026-01-01T10:02:00Z"),
+                ("TASK-LIN-1", "AGENT DONE", "BuilderAgent", '{"verifier": "AuditAgent"}', "2026-01-01T10:05:00Z"),
+                ("TASK-LIN-2", "TASK_CREATED", "PlannerAgent", "{}", "2026-01-01T10:06:00Z"),
+                ("TASK-LIN-2", "AGENT BLOCKED", "TesterAgent", '{"reason": "fixture missing"}', "2026-01-01T10:08:00Z"),
+                ("TASK-LIN-2", "AGENT CANCELLED", "PlannerAgent", "{}", "2026-01-01T10:09:00Z"),
+                ("TASK-LIN-2", "SELF_EXECUTION_OVERRIDE", "PlannerAgent", "{}", "2026-01-01T10:10:00Z"),
+            ],
+        )
+        conn.commit()
+
+    exporter = TelemetryExporter(db)
+    events = exporter.get_events()
+    mapped = [(e["task_id"], e["raw_event_type"], e["event_type"]) for e in events]
+    assert ("TASK-LIN-1", "AGENT CREATED", "created") in mapped
+    assert ("TASK-LIN-1", "AGENT CLAIMED", "claimed") in mapped
+    assert ("TASK-LIN-1", "AGENT WORKING", "claimed") in mapped
+    assert ("TASK-LIN-1", "AGENT DONE", "completed") in mapped
+    assert ("TASK-LIN-2", "TASK_CREATED", "created") in mapped
+    assert ("TASK-LIN-2", "AGENT BLOCKED", "blocked") in mapped
+    assert ("TASK-LIN-2", "AGENT CANCELLED", "cancelled") in mapped
+    assert ("TASK-LIN-2", "SELF_EXECUTION_OVERRIDE", "self_execution_override") in mapped
+
+    durations = {d["task_id"]: d for d in exporter.compute_duration_metrics()}
+    assert durations["TASK-LIN-1"]["wait_seconds"] == 60.0
+    assert durations["TASK-LIN-1"]["exec_seconds"] == 240.0
+    assert durations["TASK-LIN-1"]["total_seconds"] == 300.0
+
+    seq = exporter.generate_mermaid_sequence(task_id="TASK-LIN-1")
+    assert "Submit TASK-LIN-1 for review" in seq
+    assert "Verified TASK-LIN-1" in seq
+
+
+def test_topology_classification_and_dmv_alert(tmp_path: Path):
+    """Verify linear vs concurrent wave shape detection and verifier ratio alert."""
+    rig_dir = tmp_path / ".stigmerig"
+    db = StigmeRigDB(rig_dir=rig_dir)
+    db.init_rig(scaffold_icm=False)
+
+    with db.get_queue_conn() as conn:
+        conn.executemany(
+            """
+            INSERT INTO tasks (id, title, status, priority, created_at, updated_at, parent_id, archetype)
+            VALUES (?, ?, ?, 100, ?, ?, ?, ?)
+            """,
+            [
+                ("EPIC-LIN", "Linear Epic", "done", "2026-01-02T09:00:00Z", "2026-01-02T09:30:00Z", None, "diff_synthesizer"),
+                ("TASK-LIN-1", "Step 1", "done", "2026-01-02T09:00:00Z", "2026-01-02T09:10:00Z", "EPIC-LIN", "diff_synthesizer"),
+                ("TASK-LIN-2", "Step 2", "done", "2026-01-02T09:10:00Z", "2026-01-02T09:20:00Z", "EPIC-LIN", "unit_tester"),
+                ("TASK-LIN-3", "Step 3", "done", "2026-01-02T09:20:00Z", "2026-01-02T09:30:00Z", "EPIC-LIN", "policy_gatekeeper"),
+                ("EPIC-PAR", "Parallel Epic", "done", "2026-01-02T10:00:00Z", "2026-01-02T10:20:00Z", None, "diff_synthesizer"),
+                ("TASK-PAR-1", "Parallel 1", "done", "2026-01-02T10:00:00Z", "2026-01-02T10:15:00Z", "EPIC-PAR", "diff_synthesizer"),
+                ("TASK-PAR-2", "Parallel 2", "done", "2026-01-02T10:01:00Z", "2026-01-02T10:14:00Z", "EPIC-PAR", "diff_synthesizer"),
+                ("TASK-PAR-3", "Parallel 3", "done", "2026-01-02T10:02:00Z", "2026-01-02T10:16:00Z", "EPIC-PAR", "diff_synthesizer"),
+                ("TASK-PAR-4", "Parallel 4", "done", "2026-01-02T10:03:00Z", "2026-01-02T10:12:00Z", "EPIC-PAR", "unit_tester"),
+            ],
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
+            VALUES ('TASK-LIN-1', 'SELF_EXECUTION_OVERRIDE', 'LeadAgent', '{}', '2026-01-02T09:05:00Z')
+            """
+        )
+        conn.commit()
+
+    exporter = TelemetryExporter(db)
+    gov = exporter.compute_topology_and_dmv_metrics()
+
+    assert gov["total_records"] == 9
+    assert gov["total_tasks"] == 7
+    assert gov["completed_tasks"] == 7
+    assert gov["verify_only_tasks"] == 3
+    assert gov["verify_only_ratio"] == round(3 / 7, 4)
+    assert gov["dmv_alert"] is True
+    assert gov["ceremony_ratio"] == round(4 / 7, 4)
+
+    lin_shape = gov["epics"]["EPIC-LIN"]
+    assert lin_shape["total_tasks"] == 3
+    assert lin_shape["phase_depth"] == 3
+    assert lin_shape["max_wave_width"] == 1
+    assert lin_shape["topology_class"] == "linear"
+
+    par_shape = gov["epics"]["EPIC-PAR"]
+    assert par_shape["total_tasks"] == 4
+    assert par_shape["phase_depth"] == 1
+    assert par_shape["max_wave_width"] == 4
+    assert par_shape["topology_class"] == "concurrent"
+
+    md = exporter.generate_metrics_markdown()
+    assert "# Task Concurrency & Duration Metrics" in md
+    assert "## Governance, Topology & Blocker Summary" in md
+    assert "`EPIC-LIN`" in md
+    assert "`EPIC-PAR`" in md
+
+
+def test_fail_task_trap_deduplication_and_cli_metrics_json(tmp_path: Path, capsys):
+    """Verify fail_task deduplicates recurring blockers into traps.json and CLI exports --json."""
+    rig_dir = tmp_path / ".stigmerig"
+    db = StigmeRigDB(rig_dir=rig_dir)
+    db.init_rig(scaffold_icm=False)
+
+    for idx in range(1, 4):
+        db.create_task(
+            task_id=f"TASK-PAR-{idx}",
+            title=f"Worker unit {idx}",
+            parent_id="EPIC-PAR",
+            author="PlannerAgent",
+        )
+
+    blocker_msg = "Database migration lock timeout during schema upgrade"
+    db.fail_task("TASK-PAR-1", agent="WorkerA", reason=blocker_msg)
+    db.fail_task("TASK-PAR-2", agent="WorkerB", reason=blocker_msg)
+    db.fail_task("TASK-PAR-3", agent="WorkerC", reason=blocker_msg)
+
+    traps_path = rig_dir / "traps.json"
+    assert traps_path.exists()
+    traps_doc = json.loads(traps_path.read_text(encoding="utf-8"))
+    assert traps_doc["version"] == "1.0.0"
+    assert len(traps_doc["traps"]) == 1
+
+    trap = traps_doc["traps"][0]
+    assert trap["id"] == "TRAP-001"
+    assert trap["occurrences"] == 3
+    assert trap["promotion_candidate"] is True
+    assert trap["status"] == "candidate"
+    assert len(trap["source_traces"]) == 3
+
+    capsys.readouterr()
+    exit_code = main(["--rig-dir", str(rig_dir), "telemetry", "metrics", "--json"])
+    assert exit_code == 0
+    stdout_payload = json.loads(capsys.readouterr().out)
+    assert "durations" in stdout_payload
+    assert "governance_and_topology" in stdout_payload
+    gov = stdout_payload["governance_and_topology"]
+    assert gov["blocked_reasons"]["total_traps"] == 1
+    assert len(gov["blocked_reasons"]["recurring_candidates"]) == 1
+    assert gov["blocked_reasons"]["recurring_candidates"][0]["id"] == "TRAP-001"
+
+    out_json = tmp_path / "metrics.json"
+    exit_code_file = main(
+        ["--rig-dir", str(rig_dir), "telemetry", "metrics", "--json", "--output", str(out_json)]
+    )
+    assert exit_code_file == 0
+    file_payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert file_payload["governance_and_topology"]["blocked_reasons"]["total_traps"] == 1
+
 

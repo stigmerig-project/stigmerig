@@ -7,6 +7,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,6 +15,25 @@ from typing import Any, Dict, List, Optional, Tuple
 
 GENESIS_HASH: str = "0" * 64
 WORKFLOW_RAILS: Tuple[str, ...] = ("diff_synthesizer", "unit_tester", "policy_gatekeeper")
+_TRAP_STOP_WORDS: frozenset[str] = frozenset({
+    "with", "from", "that", "this", "have", "been", "were", "when", "what",
+    "where", "which", "while", "into", "onto", "upon", "over", "under",
+    "after", "before", "because", "during", "through", "about", "against",
+    "between", "without", "within", "cannot", "could", "should", "would",
+    "task", "failed", "blocked", "error", "issue", "problem", "unable",
+})
+
+
+def _normalize_blocker_signature(reason: str) -> str:
+    """Extract deterministic keyword signature (>= 4 chars excluding stop words) from blocker reason."""
+    clean = (reason or "").strip().lower()
+    raw_tokens = re.findall(r"[a-z0-9_]+", clean)
+    keywords = list(
+        dict.fromkeys(t for t in raw_tokens if len(t) >= 4 and t not in _TRAP_STOP_WORDS)
+    )
+    if not keywords:
+        keywords = list(dict.fromkeys(t for t in raw_tokens if len(t) >= 2))
+    return " ".join(keywords) if keywords else clean
 
 DEFAULT_AGENTS_TEMPLATE = """# AGENTS
 
@@ -613,7 +633,87 @@ Add task details and acceptance criteria here.
             payload=json.dumps({"reason": reason}),
         )
         self.sync_board()
+        try:
+            self._record_blocker_trap(task_id=task_id, agent=agent, reason=reason)
+        except Exception:
+            pass
         return True
+
+    def _record_blocker_trap(
+        self,
+        task_id: str,
+        agent: str,
+        reason: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Persist deduplicated blocker trap candidates into traps.json (failure-soft)."""
+        clean_reason = (reason or "").strip() or "unspecified blocker"
+        trigger_pattern = _normalize_blocker_signature(clean_reason)
+        traps_path = self.rig_dir / "traps.json"
+        now = utc_now_iso()
+        trace_entry = f"Task {task_id} ({agent})"
+
+        doc: Dict[str, Any] = {"version": "1.0.0", "traps": []}
+        if traps_path.exists():
+            try:
+                loaded = json.loads(traps_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict) and isinstance(loaded.get("traps"), list):
+                    doc = loaded
+                    doc.setdefault("version", "1.0.0")
+            except Exception:
+                doc = {"version": "1.0.0", "traps": []}
+
+        traps: List[Dict[str, Any]] = doc["traps"]
+        matched: Optional[Dict[str, Any]] = None
+        norm_title = clean_reason.lower()
+
+        for entry in traps:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("status") or "").strip().lower() == "dismissed":
+                continue
+            existing_pattern = str(entry.get("trigger_pattern") or "").strip().lower()
+            existing_title = str(entry.get("title") or entry.get("reason") or "").strip().lower()
+            if (
+                (trigger_pattern and existing_pattern == trigger_pattern)
+                or existing_title == norm_title
+                or (trigger_pattern and _normalize_blocker_signature(existing_title) == trigger_pattern)
+            ):
+                matched = entry
+                break
+
+        if matched is not None:
+            occurrences = int(matched.get("occurrences", 0)) + 1
+            matched["occurrences"] = occurrences
+            matched["last_seen_at"] = now
+            traces = [str(x) for x in (matched.get("source_traces") or [])]
+            traces.append(trace_entry)
+            matched["source_traces"] = traces[-10:]
+            matched["promotion_candidate"] = occurrences >= 3
+            result = matched
+        else:
+            max_num = 0
+            for entry in traps:
+                if isinstance(entry, dict):
+                    m = re.match(r"^TRAP-(\d+)$", str(entry.get("id") or ""))
+                    if m:
+                        max_num = max(max_num, int(m.group(1)))
+            trap_id = f"TRAP-{max(max_num, len(traps)) + 1:03d}"
+            result = {
+                "id": trap_id,
+                "title": clean_reason[:120],
+                "reason": clean_reason,
+                "trigger_pattern": trigger_pattern,
+                "status": "candidate",
+                "occurrences": 1,
+                "promotion_candidate": False,
+                "first_seen_at": now,
+                "last_seen_at": now,
+                "source_traces": [trace_entry],
+            }
+            traps.append(result)
+
+        traps_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        return result
 
     def log_audit(
         self,

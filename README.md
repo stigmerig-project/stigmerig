@@ -14,7 +14,7 @@ It coordinates autonomous coding agents through environmental stigmergy without 
 StigmeRig synthesizes foundational concepts across biology, distributed systems, and agent architecture:
 
 - **Pierre-Paul Grasse (1959)**: Formulated biological stigmergy, showing how decentralized social insects coordinate indirectly through environmental modifications.
-- **Nate B Jones (`OpenEngine` & `OpenRig`)**: Pioneered sovereign local-first AI architectures, deterministic agent rails, and strict execution-verification separation.
+- **Nate B Jones (`OpenRig`)**: Pioneered sovereign local-first AI architectures, deterministic agent rails, and strict execution-verification separation.
 - **Jake Van Clief (`Interpretable Context Model - ICM`)**: Formulated file-over-app execution boundaries, tiered context pruning, and automated orientation scaffolding (`AGENTS.md` and `CONTEXT.md`).
 - **Mike (`@FeralMachine`) (`OpenRig`)**: Architected multi-agent civilization topologies, persistent rigs, and progressive disclosure context engineering.
 - **Marcus Schwarz (`@mvschwarz`)**: Developed early file-based and SQLite task queues for local agent developer swarms.
@@ -127,6 +127,52 @@ Verify cryptographic hash-chain integrity:
 stigmerig audit verify
 ```
 
+## Deterministic Telemetry and Trap Tracking
+
+StigmeRig computes task durations, governance overhead, epic wave shapes, and recurring blockers directly from SQLite logs.
+
+Render a human-readable Markdown summary table:
+
+```bash
+stigmerig telemetry metrics
+```
+
+Export structured metrics as JSON for automated CI gates or dashboards:
+
+```bash
+stigmerig telemetry metrics --json
+```
+
+Generate Mermaid sequence diagrams of agent handoffs with `stigmerig telemetry sequence`.
+
+### Anti-DMV Governance Ratios
+
+Swarm pipelines stall when verification tasks outnumber implementation work.
+StigmeRig audits leaf tasks against four verify-only archetypes (`unit_tester`, `prose_auditor`, `policy_gatekeeper`, `topology_reader`):
+
+- **`verify_only_ratio`**: Measures verify-only leaf tasks divided by total leaf tasks, targeting `<= 0.30`.
+- **`dmv_alert`**: Triggers `true` whenever `verify_only_ratio` exceeds `0.30`.
+- **`ceremony_ratio`**: Combines verify-only tasks and `self_execution_override` events divided by total leaf tasks.
+
+### Epic Wave Topology
+
+For tasks grouped under a parent epic (such as `EPIC-01`), StigmeRig analyzes execution intervals:
+
+- **`phase_depth`**: Counts sequential execution waves within the epic.
+- **`max_wave_width`**: Measures peak concurrent tasks executing in a single wave.
+- **`topology_class`**: Classifies each epic as `single`, `concurrent`, `linear`, or `hybrid_dag`.
+
+### Deduplicated Blocker Traps
+
+Marking a task blocked via `stigmerig task fail` records a normalized failure signature in `.stigmerig/traps.json`:
+
+```bash
+stigmerig task fail --id TASK-001 --agent AgentAlpha --reason "SQLite lock timeout on queue.db"
+```
+
+Repeated failures matching the same normalized signature increment `occurrences` instead of creating duplicate entries.
+When `occurrences` reaches `>= 3`, StigmeRig sets `promotion_candidate` to `true` and surfaces the trap in telemetry reports.
+
 ## Multi-Harness Integration Guide
 
 StigmeRig coordinates autonomous agents across heterogeneous developer environments without proprietary plugins.
@@ -189,3 +235,4 @@ StigmeRig provides bidirectional compatibility between standalone projects (Tier
 - **Task Markdown Structure**: Supports both flat `tasks/<ID>.md` files and nested `tasks/<ID>/context.md` directories.
 - **Audit Chain Verification**: The `stigmerig audit verify` command validates both Tier A seven-field header schemas and Tier B `v2:` hash chains.
 - **External Rig Isolation**: Passing `--rig-dir` directs state and task files to the target project, generating `<rig_dir>/Task_Board.md` without clobbering parent boards.
+- **Event Schema Normalization**: Telemetry normalizes Tier A and Tier B `task_events` columns and lifecycle verbs into canonical states.
