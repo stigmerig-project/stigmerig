@@ -1,6 +1,6 @@
 {
   "slug": "stigmerig-brand-avatar",
-  "concept": "StigmeRig official organization avatar - The Comb Guild (Triad)",
+  "concept": "StigmeRig official brand mark, social preview, and architecture schematic - The Comb Guild (Triad)",
   "archetype": "instrumentation",
   "engine": "html",
   "provenance": {
@@ -10,12 +10,27 @@
       1024,
       1024
     ],
+    "viewports": {
+      "stigmerig-avatar.png": [
+        1024,
+        1024
+      ],
+      "stigmerig-social-preview.png": [
+        1280,
+        640
+      ],
+      "stigmerig-architecture.png": [
+        1440,
+        810
+      ]
+    },
     "renderer": "chromium-playwright"
   },
-  "timestamp": "2026-11-09T19:43:47.994488+00:00",
+  "timestamp": "2026-11-12T14:46:09.559862+00:00",
   "files": {
-    "stigmerig-logo.svg": "4ae6e007fa9e97a7813628e4af5b699c2bb90a78bc069c0c52b38f45d630f2f7",
+    "stigmerig-logo.svg": "70b7d49882dee784782412f79bab8683060db795aed29535d2cd6d781010e382",
     "stigmerig-avatar.png": "0c728d0a73695a772405f36dfd5b3033da38ccc4a67ab5eb739e94b7095788eb",
-    "stigmerig-social-preview.png": "eb7933886644c87c06b9cb02c4ef6b2bd3b089f50028adc741d4790e99a2aa73"
+    "stigmerig-social-preview.png": "c1c117958673588476c281109ed2d3e4e92dc0f6f02efde536eda5abb816c879",
+    "stigmerig-architecture.png": "c3c4aade7ac3a7e12c256a5bb165823db987976fecc57cdc36f69f8bfc4e1359"
   }
 }

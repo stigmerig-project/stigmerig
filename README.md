@@ -7,7 +7,7 @@
 StigmeRig is a sovereign, local-first multi-agent coordination engine.
 It coordinates autonomous coding agents through environmental stigmergy without centralized cloud brokers.
 
-<p align="center"><img src="assets/stigmerig-avatar.png" alt="StigmeRig Logo" width="160" /></p>
+![StigmeRig — Multi-Agent Coordination and Orchestration Engine](assets/stigmerig-social-preview.png)
 
 ## Intellectual Lineage and Provenance
 
@@ -19,17 +19,32 @@ StigmeRig synthesizes foundational concepts across biology, distributed systems,
 - **Mike (`@FeralMachine`) (`OpenRig`)**: Architected multi-agent civilization topologies, persistent rigs, and progressive disclosure context engineering.
 - **Marcus Schwarz (`@mvschwarz`)**: Developed early file-based and SQLite task queues for local agent developer swarms.
 
+## Control Plane Architecture
+
+StigmeRig structures autonomous work across a four-stage deterministic pipeline backed by SQLite WAL state and git worktrees.
+
+![StigmeRig Control Plane Architecture](assets/stigmerig-architecture.png)
+
+1. **ICM and Atomic Queue (`.stigmerig/queue.db`)**: Scaffolds repository orientation files and coordinates priority claims via Compare-And-Swap (`version`) leases.
+2. **Worktree Waves (`stigmerig.wave`)**: Bounds concurrent execution to 3 to 5 tasks inside isolated `.worktrees/<ID>` git branches.
+3. **Separation of Duties (`Verifier Gate`)**: Blocks missing verifiers and aliased self-approvals while routing handoffs across workflow rails.
+4. **WORM Audit and Telemetry (`audit.db` and `traps.json`)**: Enforces trigger-protected SHA-256 hash chains, Anti-DMV governance ratios, and blocker deduplication.
+
 ## Swarm Failure Modes and Architectural Defenses
 
-Multi-agent swarms fail predictably when unconstrained. StigmeRig provides deterministic mechanisms against five core failure modes:
+Multi-agent swarms fail predictably when unconstrained. StigmeRig provides deterministic defenses against nine failure modes:
 
 | Swarm Failure Mode | Pathological Behavior | StigmeRig Architectural Defense |
 | :--- | :--- | :--- |
-| **Split-Brain Contention** | Multiple agents claim the same task simultaneously and overwrite files. | SQLite WAL mode with atomic Compare-And-Swap (CAS) leases and automated TTL expiration. |
-| **Self-Approval Collusion** | The agent authoring code reviews and verifies its own work. | Enforces strict Separation of Concerns; `stigmerig task done` rejects self-verification. |
-| **Audit Ledger Tampering** | Agents rewrite history or delete failed execution traces. | Cryptographic WORM hash chain with SQLite triggers preventing row updates or deletions. |
-| **Context Window Blowout** | Agents pass unbounded conversational history, exhausting token budgets. | Environmental stigmergy coordinates via database state and compact task handoff receipts. |
-| **Recursive Swarm Traps** | Agents cycle endlessly on edge cases or expand task scope. | Workflow rails enforce archetype transitions (`diff_synthesizer` to `unit_tester`) and concurrency caps. |
+| **Split-Brain Contention** | Multiple agents claim the same task simultaneously and overwrite files. | SQLite WAL mode with atomic Compare-And-Swap (CAS) `version` leases and automated `--ttl` expiration. |
+| **Self-Approval Collusion** | An implementing agent reviews or approves its own changes via identity aliases. | Rejects missing verifiers and parses composite seat components across `/`, `@`, and `:` delimiters. |
+| **Audit Ledger Tampering** | Agents rewrite task history or delete failed execution traces. | Cryptographic SHA-256 WORM hash chain with SQLite triggers blocking `UPDATE` and `DELETE` operations. |
+| **Context Window Blowout** | Agents pass unbounded conversational history, exhausting token budgets. | Environmental stigmergy coordinates through compact SQLite state transitions and scoped task files. |
+| **Recursive Swarm Traps** | Agents cycle endlessly on edge cases or expand task scope. | Workflow rails guide archetype transitions (`diff_synthesizer` to `unit_tester` to `policy_gatekeeper`). |
+| **Verification Bureaucracy ("DMV Trap")** | Review ceremony outnumbers implementation work and stalls delivery. | Tracks `verify_only_ratio <= 0.30`, `dmv_alert`, and `ceremony_ratio` across leaf archetypes. |
+| **Amnesiac Repeat Failures** | Agents hit identical blockers repeatedly without retaining institutional memory. | Deduplicates normalized failure signatures in `.stigmerig/traps.json`, flagging `promotion_candidate` at `occurrences >= 3`. |
+| **Parallel Branch Collisions** | Concurrent workers corrupt shared working trees or leave half-merged conflicts. | `WorktreeManager` and `WaveRunner` enforce 3–5 wave caps, clean-tree checks, and `git merge --abort` rollback. |
+| **Parent-Board Clobbering** | Subproject swarms overwrite root workspace queues, boards, or trap registries. | `--rig-dir` and `STIGMERIG_ROOT` isolate local `queue.db`, `<rig_dir>/Task_Board.md`, and `<rig_dir>/traps.json`. |
 
 ## Standards Alignment: NIST AI RMF and SSDF
 
@@ -50,12 +65,15 @@ StigmeRig implements controls aligned with federal and international software as
 
 ## Core Features
 
-- **Local-First State**: Operates entirely on SQLite WAL mode with zero network dependencies.
-- **WORM Audit Ledger**: Enforces write-once, read-many SHA-256 hash chains verified by SQLite triggers.
-- **ICM Startup Scaffolding**: Generates `AGENTS.md`, `CONTEXT.md`, and `.stigmerig/rig.json` on initialization (via Jake Van Clief's ICM model).
-- **Workflow Rails**: Recommends next execution steps across archetypes upon task completion.
-- **Worktree Isolation**: Automates isolated git worktree sandboxes for concurrent task branches.
-- **Zero Cloud Dependencies**: Implemented strictly using the Python standard library and pytest.
+- **Local-First SQLite WAL State**: Coordinates concurrent readers and writers in `.stigmerig/queue.db` with zero network brokers.
+- **WORM Cryptographic Audit Ledger**: Protects `.stigmerig/audit.db` with SHA-256 hash chaining and SQLite `BEFORE UPDATE` and `BEFORE DELETE` triggers.
+- **ICM Startup Scaffolding**: Generates `AGENTS.md`, `CONTEXT.md`, and `.stigmerig/rig.json` on initialization, writing `.stigmerig/AGENTS.stigmerig.md` when `AGENTS.md` exists.
+- **Composite Anti-Self-Approval Gate**: Blocks direct and aliased self-verification across `seat/agent`, `agent@host`, and `role:agent` identifiers.
+- **Rolling Git Worktree Waves**: Executes 3 to 5 tasks per batch in `.worktrees/<ID>` with archetype commit attribution and `--no-ff` merges.
+- **Anti-DMV and Wave Topology Telemetry**: Computes `verify_only_ratio`, `ceremony_ratio`, epic `phase_depth`, `max_wave_width`, and Mermaid handoff diagrams.
+- **Normalized Blocker Trap Harvesting**: Deduplicates recurring failure signatures in `.stigmerig/traps.json` and promotes persistent traps at three occurrences.
+- **Tier A and Tier B Schema Interoperability**: Reads flat or nested task files, normalizes event schemas, and isolates `--rig-dir` sandboxes.
+- **Zero Runtime Cloud Dependencies**: Built purely on the Python 3.10+ standard library (`sqlite3`, `argparse`, `hashlib`, `subprocess`).
 
 ## Installation
 
@@ -127,6 +145,44 @@ Verify cryptographic hash-chain integrity:
 stigmerig audit verify
 ```
 
+## Rolling Wave and Git Worktree Orchestration
+
+For concurrent multi-agent execution, `stigmerig.wave` pairs `WorktreeManager` with `WaveRunner` to isolate file mutations per task.
+
+```python
+from pathlib import Path
+from stigmerig.db import StigmeRigDB
+from stigmerig.wave import WaveRunner, WorktreeManager
+
+db = StigmeRigDB()
+wt = WorktreeManager()
+runner = WaveRunner(db=db, worktree_mgr=wt)
+
+def build_auth(worktree_dir: Path) -> bool:
+    (worktree_dir / "auth.py").write_text("def verify_token():\n    return True\n", encoding="utf-8")
+    return True
+
+results = runner.run_wave(
+    [
+        {
+            "task_id": "TASK-001",
+            "agent": "BuilderAlpha",
+            "verifier": "TesterBeta",
+            "archetype": "diff_synthesizer",
+            "action": build_auth,
+        }
+    ],
+    max_concurrency=3,
+)
+```
+
+`WaveRunner` enforces four deterministic execution invariants:
+
+- **Bounded Concurrency**: Clamps `max_concurrency` to a ceiling of 5 tasks per wave (recommended 3 to 5).
+- **Isolated Task Branches**: Creates `.worktrees/<ID>` bound to branch `task/<ID>` before invoking the worker callback.
+- **Archetype Git Attribution**: Commits staged changes under `<Swarm> [<archetype>]` author metadata and `<Swarm> [orchestrator]` committer metadata.
+- **Safe Non-Fast-Forward Merge**: Verifies a clean worktree, merges with `git merge --no-ff`, or runs `git merge --abort` on conflict.
+
 ## Deterministic Telemetry and Trap Tracking
 
 StigmeRig computes task durations, governance overhead, epic wave shapes, and recurring blockers directly from SQLite logs.
@@ -172,6 +228,31 @@ stigmerig task fail --id TASK-001 --agent AgentAlpha --reason "SQLite lock timeo
 
 Repeated failures matching the same normalized signature increment `occurrences` instead of creating duplicate entries.
 When `occurrences` reaches `>= 3`, StigmeRig sets `promotion_candidate` to `true` and surfaces the trap in telemetry reports.
+
+## CLI and Environment Reference
+
+Pass `--rig-dir <path>` before any subcommand to target an isolated `.stigmerig` state directory.
+
+| Command | Purpose | Key Flags |
+| :--- | :--- | :--- |
+| `stigmerig init` | Initialize SQLite databases, `Task_Board.md`, and ICM files. | `--path <dir>`, `--no-icm` |
+| `stigmerig task create` | Register a task in `queue.db` and scaffold its Markdown context. | `--id`, `--title`, `--parent`, `--archetype`, `--priority`, `--tags`, `--author` |
+| `stigmerig task list` | Query tasks ordered by priority and creation timestamp. | `--status <todo\|working\|done\|blocked>`, `--parent <id>` |
+| `stigmerig task get` | Inspect full JSON metadata for a single task. | `--id` |
+| `stigmerig task claim` | Acquire an atomic CAS task lease with expiration TTL. | `--id`, `--agent`, `--ttl <seconds>` |
+| `stigmerig task done` | Close a task after independent verification and compute next rail step. | `--id`, `--agent`, `--verifier`, `--session-id`, `--allow-self-approval` |
+| `stigmerig task fail` | Mark a task blocked and deduplicate its blocker signature in `traps.json`. | `--id`, `--agent`, `--reason` |
+| `stigmerig audit log` | Append a custom SHA-256 hash-chained entry to `audit.db`. | `--task`, `--action`, `--agent`, `--status`, `--payload` |
+| `stigmerig audit verify` | Validate genesis continuity and SHA-256 digests across `audit_log`. | None |
+| `stigmerig board sync` | Regenerate `<rig_dir>/Task_Board.md` from `queue.db`. | None |
+| `stigmerig telemetry sequence` | Emit a Mermaid sequence diagram of recorded agent handoffs. | `--task <id>`, `--output <file>` |
+| `stigmerig telemetry metrics` | Export task durations, Anti-DMV ratios, wave shapes, and recurring traps. | `--json`, `--output <file>` |
+
+Environment variables configure default runtime resolution:
+
+- **`STIGMERIG_ROOT`**: Overrides the default `.stigmerig` directory when `--rig-dir` is omitted.
+- **`STIGMERIG_SEAT`**: Sets explicit seat attribution in completion audit payloads (falls back to `AGENT_SEAT` or agent prefix).
+- **`STIGMERIG_SWARM_NAME`**: Customizes git author and committer prefixes for `WorktreeManager` and `WaveRunner` commits.
 
 ## Multi-Harness Integration Guide
 
