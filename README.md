@@ -62,11 +62,11 @@ StigmeRig implements controls aligned with federal and international software as
 Install StigmeRig directly from GitHub using pip or uv:
 
 ```bash
-pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.1"
+pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.3"
 ```
 
 ```bash
-uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.1"
+uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.3"
 ```
 
 Alternatively, clone the repository for editable local development:
