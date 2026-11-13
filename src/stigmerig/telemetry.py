@@ -282,6 +282,33 @@ class TelemetryExporter:
             else 0.0
         )
 
+        leaf_ids = {t["id"] for t in leaf_tasks}
+        claimants_by_task: Dict[str, set[str]] = {}
+        blocked_leaf_ids: set[str] = set()
+        force_claimed_leaf_ids: set[str] = set()
+        for ev in events:
+            tid = ev.get("task_id")
+            if not tid or tid not in leaf_ids:
+                continue
+            ev_type = ev.get("event_type")
+            if ev_type == "claimed":
+                actor = str(ev.get("agent") or "").strip().lower()
+                if actor:
+                    claimants_by_task.setdefault(tid, set()).add(actor)
+                msg_text = str(ev.get("payload") or ev.get("message") or "").lstrip()
+                if msg_text.startswith("Force-claimed"):
+                    force_claimed_leaf_ids.add(tid)
+            elif ev_type == "blocked":
+                blocked_leaf_ids.add(tid)
+
+        rework_task_ids = (
+            {tid for tid, actors in claimants_by_task.items() if len(actors) >= 2}
+            | blocked_leaf_ids
+            | force_claimed_leaf_ids
+        )
+        rework_tasks = len(rework_task_ids)
+        rework_rate = round(rework_tasks / total_tasks, 4) if total_tasks > 0 else 0.0
+
         grouped_by_epic: Dict[str, List[Dict[str, Any]]] = {}
         for t in leaf_tasks:
             parent_id = str(t.get("parent_id") or "").strip()
@@ -394,6 +421,8 @@ class TelemetryExporter:
             "dmv_alert": dmv_alert,
             "self_execution_overrides": self_execution_overrides,
             "ceremony_ratio": ceremony_ratio,
+            "rework_tasks": rework_tasks,
+            "rework_rate": rework_rate,
             "epics": epics_summary,
             "blocked_reasons": {
                 "by_reason": reason_counts,
@@ -433,6 +462,7 @@ class TelemetryExporter:
             f"- **Leaf Tasks**: {gov['completed_tasks']} / {gov['total_tasks']} completed ({gov['total_records']} total records)",
             f"- **Verify-Only Ratio (`verify_only_ratio`)**: {gov['verify_only_ratio']:.4f} (`dmv_alert`: `{gov['dmv_alert']}`)",
             f"- **Ceremony Ratio (`ceremony_ratio`)**: {gov['ceremony_ratio']:.4f} (overrides: {gov['self_execution_overrides']})",
+            f"- **Rework Rate (`rework_rate`)**: {gov['rework_rate']:.4f} ({gov['rework_tasks']} / {gov['total_tasks']} leaf tasks)",
             f"- **Recorded Traps**: {gov['blocked_reasons']['total_traps']} total, {len(gov['blocked_reasons']['recurring_candidates'])} recurring candidates",
         ])
 

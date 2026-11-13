@@ -89,11 +89,11 @@ StigmeRig enforces four operational security and concurrency invariants across a
 Install StigmeRig directly from GitHub using pip or uv:
 
 ```bash
-pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.4"
+pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.5"
 ```
 
 ```bash
-uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.4"
+uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.5"
 ```
 
 Alternatively, clone the repository for editable local development:
@@ -147,6 +147,8 @@ StigmeRig enforces separation of duties. The implementation agent cannot approve
 ```bash
 stigmerig task done --id TASK-001 --agent AgentAlpha --verifier AgentBeta --session-id "session-001"
 ```
+
+Attach repeatable `--evidence <path>` flags to bind verification artifacts to the completion event. Each path must resolve inside the repository root. StigmeRig hashes each file in 64 KiB chunks into `task_events.payload` and `audit.db` `payload_hash`.
 
 Verify cryptographic hash-chain integrity:
 
@@ -218,6 +220,8 @@ StigmeRig audits leaf tasks against four verify-only archetypes (`unit_tester`, 
 - **`verify_only_ratio`**: Measures verify-only leaf tasks divided by total leaf tasks, targeting `<= 0.30`.
 - **`dmv_alert`**: Triggers `true` whenever `verify_only_ratio` exceeds `0.30`.
 - **`ceremony_ratio`**: Combines verify-only tasks and `self_execution_override` events divided by total leaf tasks.
+- **`rework_tasks`**: Counts tasks with distinct claimants, blocked transitions, or force-claimed leases under the Normative Rework Definition.
+- **`rework_rate`**: Divides `rework_tasks` by total tasks in `stigmerig telemetry metrics --json`.
 
 ### Epic Wave Topology
 
@@ -249,7 +253,7 @@ Pass `--rig-dir <path>` before any subcommand to target an isolated `.stigmerig`
 | `stigmerig task list` | Query tasks ordered by priority and creation timestamp. | `--status <todo\|working\|done\|blocked>`, `--parent <id>` |
 | `stigmerig task get` | Inspect full JSON metadata for a single task. | `--id` |
 | `stigmerig task claim` | Acquire an atomic CAS task lease with expiration TTL. | `--id`, `--agent`, `--ttl <seconds>` |
-| `stigmerig task done` | Close a task after independent verification and compute next rail step. | `--id`, `--agent`, `--verifier`, `--session-id`, `--allow-self-approval` |
+| `stigmerig task done` | Close a task after independent verification and compute next rail step. | `--id`, `--agent`, `--verifier`, `--session-id`, `--evidence`, `--allow-self-approval` |
 | `stigmerig task fail` | Mark a task blocked and deduplicate its blocker signature in `traps.json`. | `--id`, `--agent`, `--reason` |
 | `stigmerig audit log` | Append a custom SHA-256 hash-chained entry to `audit.db`. | `--task`, `--action`, `--agent`, `--status`, `--payload` |
 | `stigmerig audit verify` | Validate genesis continuity and SHA-256 digests across `audit_log`. | None |

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stigmerig"
-version = "0.1.4"
+version = "0.1.5"
 description = "Sovereign, local-first multi-agent stigmergy coordination engine"
 readme = "README.md"
 requires-python = ">=3.10"

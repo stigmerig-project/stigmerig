@@ -1,5 +1,6 @@
 """Unit tests for StigmeRig git worktree manager, wave runner, and telemetry."""
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -677,6 +678,177 @@ def test_scoped_git_staging_excludes_stigmerig_and_sqlite(git_repo: Path):
     assert ".stigmerig/temp_queue.db" not in ls_files
     assert "audit.db-wal" not in ls_files
     assert "audit.db-shm" not in ls_files
+
+
+def test_complete_task_and_cli_evidence_binding(tmp_path: Path):
+    """Verify complete_task and CLI task done --evidence bind SHA-256 digests and reject invalid paths."""
+    repo_root = tmp_path / "workspace"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    rig_dir = repo_root / ".stigmerig"
+    db = StigmeRigDB(rig_dir=rig_dir)
+    db.init_rig()
+
+    ev_file = repo_root / "proof.txt"
+    ev_bytes = b"clean-room verification output\n"
+    ev_file.write_bytes(ev_bytes)
+    expected_sha = hashlib.sha256(ev_bytes).hexdigest()
+
+    # 1. Direct DB complete_task(..., evidence_paths=...)
+    db.create_task(task_id="TASK-EV-1", title="Direct evidence task", author="Architect")
+    assert db.claim_task(task_id="TASK-EV-1", agent="WorkerA") is True
+    ok, msg = db.complete_task(
+        task_id="TASK-EV-1",
+        agent="WorkerA",
+        verifier="VerifierB",
+        evidence_paths=[ev_file],
+    )
+    assert ok is True, msg
+
+    with db.get_queue_conn() as conn:
+        ev_row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'completed'",
+            ("TASK-EV-1",),
+        ).fetchone()
+    assert ev_row is not None
+    raw_event_payload = ev_row["payload"]
+    event_payload = json.loads(raw_event_payload)
+    assert event_payload["evidence"] == [
+        {"path": "proof.txt", "sha256": expected_sha, "bytes": len(ev_bytes)}
+    ]
+
+    with db.get_audit_conn() as conn:
+        audit_row = conn.execute(
+            "SELECT payload_hash FROM audit_log WHERE task_id = ? AND action = 'task_completed'",
+            ("TASK-EV-1",),
+        ).fetchone()
+    assert audit_row is not None
+    assert audit_row["payload_hash"] == hashlib.sha256(raw_event_payload.encode("utf-8")).hexdigest()
+
+    # 2. CLI task done --evidence
+    db.create_task(task_id="TASK-EV-CLI", title="CLI evidence task", author="Architect")
+    assert db.claim_task(task_id="TASK-EV-CLI", agent="WorkerA") is True
+    code = main(
+        [
+            "--rig-dir",
+            str(rig_dir),
+            "task",
+            "done",
+            "--id",
+            "TASK-EV-CLI",
+            "--agent",
+            "WorkerA",
+            "--verifier",
+            "VerifierB",
+            "--evidence",
+            "proof.txt",
+        ]
+    )
+    assert code == 0
+
+    with db.get_queue_conn() as conn:
+        cli_ev_row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'completed'",
+            ("TASK-EV-CLI",),
+        ).fetchone()
+    assert cli_ev_row is not None
+    cli_raw_payload = cli_ev_row["payload"]
+    assert json.loads(cli_raw_payload)["evidence"] == [
+        {"path": "proof.txt", "sha256": expected_sha, "bytes": len(ev_bytes)}
+    ]
+    with db.get_audit_conn() as conn:
+        cli_audit_row = conn.execute(
+            "SELECT payload_hash FROM audit_log WHERE task_id = ? AND action = 'task_completed'",
+            ("TASK-EV-CLI",),
+        ).fetchone()
+    assert cli_audit_row is not None
+    assert cli_audit_row["payload_hash"] == hashlib.sha256(cli_raw_payload.encode("utf-8")).hexdigest()
+
+    # 3. Negative cases must fail before mutating tasks.status or audit.db
+    outside_file = tmp_path / "outside.txt"
+    outside_file.write_text("outside", encoding="utf-8")
+    (repo_root / "empty.txt").write_bytes(b"")
+    (repo_root / ".env").write_text("TOKEN=redacted", encoding="utf-8")
+    worktrees_dir = repo_root / ".worktrees"
+    worktrees_dir.mkdir(parents=True, exist_ok=True)
+    (worktrees_dir / "scratch.txt").write_text("wt", encoding="utf-8")
+
+    db.create_task(task_id="TASK-EV-NEG", title="Negative evidence task", author="Architect")
+    assert db.claim_task(task_id="TASK-EV-NEG", agent="WorkerA") is True
+
+    with db.get_audit_conn() as conn:
+        baseline_audit_count = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+
+    negative_cases = [
+        ("missing.txt", FileNotFoundError),
+        ("empty.txt", ValueError),
+        ("../outside.txt", ValueError),
+        (".env", ValueError),
+        (".stigmerig/queue.db", ValueError),
+        (".worktrees/scratch.txt", ValueError),
+        ("queue.db", ValueError),
+    ]
+    for bad_path, expected_exc in negative_cases:
+        with pytest.raises(expected_exc):
+            db.complete_task(
+                task_id="TASK-EV-NEG",
+                agent="WorkerA",
+                verifier="VerifierB",
+                evidence_paths=[bad_path],
+            )
+        task_state = db.get_task("TASK-EV-NEG")
+        assert task_state is not None
+        assert task_state["status"] == "working"
+        with db.get_audit_conn() as conn:
+            current_audit_count = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+        assert current_audit_count == baseline_audit_count
+
+
+def test_telemetry_normative_rework_definition(tmp_path: Path):
+    """Verify TelemetryExporter.compute_topology_and_dmv_metrics() across all 4 rework cases."""
+    rig_dir = tmp_path / ".stigmerig"
+    db = StigmeRigDB(rig_dir=rig_dir)
+    db.init_rig()
+
+    db.create_task(task_id="EPIC-RW-1", title="Rework Epic", author="Architect")
+    for idx in range(1, 6):
+        db.create_task(
+            task_id=f"TASK-RW-{idx}",
+            title=f"Rework case {idx}",
+            parent_id="EPIC-RW-1",
+            author="Architect",
+        )
+
+    with db.get_queue_conn() as conn:
+        conn.executemany(
+            """
+            INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                # 1) Distinct-claimant reassignment -> counts as rework
+                ("TASK-RW-1", "claimed", "worker_one", "Initial claim", "2026-11-12T09:00:00Z"),
+                ("TASK-RW-1", "claimed", "worker_two", "Reassigned", "2026-11-12T09:10:00Z"),
+                # 2) Same-actor repeat claim -> does NOT count as rework
+                ("TASK-RW-2", "claimed", "worker_three", "Initial claim", "2026-11-12T09:15:00Z"),
+                ("TASK-RW-2", "claimed", "Worker_Three", "Renewed claim", "2026-11-12T09:20:00Z"),
+                # 3) Force-claim message prefix -> counts as rework
+                ("TASK-RW-3", "claimed", "worker_four", "Force-claimed due to lease expiry", "2026-11-12T09:25:00Z"),
+                # 4) Blocked event -> counts as rework
+                ("TASK-RW-4", "blocked", "worker_five", "Dependency failure", "2026-11-12T09:30:00Z"),
+                # Clean task -> NOT rework
+                ("TASK-RW-5", "claimed", "worker_six", "Initial claim", "2026-11-12T09:35:00Z"),
+                # Epic-level blocked event -> excluded from leaf rework metrics
+                ("EPIC-RW-1", "blocked", "orchestrator", "Epic hold", "2026-11-12T09:40:00Z"),
+            ],
+        )
+        conn.commit()
+
+    exporter = TelemetryExporter(db)
+    metrics = exporter.compute_topology_and_dmv_metrics()
+
+    assert metrics["total_tasks"] == 5
+    assert metrics["rework_tasks"] == 3
+    assert metrics["rework_rate"] == round(3 / 5, 4)
 
 
 

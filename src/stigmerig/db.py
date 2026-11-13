@@ -10,7 +10,7 @@ import os
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 GENESIS_HASH: str = "0" * 64
@@ -514,6 +514,56 @@ Add task details and acceptance criteria here.
             self.sync_board()
         return success
 
+    def _validate_and_hash_evidence(
+        self,
+        evidence_paths: Sequence[str | Path],
+    ) -> List[Dict[str, Any]]:
+        """Validate evidence paths against workspace boundaries and return SHA-256 metadata."""
+        allowed_root = self.rig_dir.resolve().parent
+        records: List[Dict[str, Any]] = []
+        for raw_path in evidence_paths:
+            p = Path(raw_path)
+            resolved = p.resolve() if p.is_absolute() else (allowed_root / p).resolve()
+            if not resolved.is_relative_to(allowed_root):
+                raise ValueError(f"Evidence path escapes allowed root: {raw_path}")
+
+            rel = resolved.relative_to(allowed_root)
+            rel_parts_lower = [part.lower() for part in rel.parts]
+            name_lower = resolved.name.lower()
+
+            if (
+                ".stigmerig" in rel_parts_lower
+                or ".worktrees" in rel_parts_lower
+                or any(part == ".env" or part.startswith(".env.") for part in rel_parts_lower)
+                or name_lower == ".env"
+                or name_lower.startswith(".env.")
+                or name_lower.startswith("queue.db")
+                or name_lower.startswith("audit.db")
+            ):
+                raise ValueError(f"Evidence path matches denied pattern: {raw_path}")
+
+            if not resolved.exists() or not resolved.is_file():
+                raise FileNotFoundError(f"Evidence file not found: {raw_path}")
+
+            size = resolved.stat().st_size
+            if size <= 0:
+                raise ValueError(f"Evidence file must be non-empty: {raw_path}")
+
+            digest = hashlib.sha256()
+            with resolved.open("rb") as fh:
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+
+            records.append({
+                "path": rel.as_posix(),
+                "sha256": digest.hexdigest(),
+                "bytes": size,
+            })
+        return records
+
     def complete_task(
         self,
         task_id: str,
@@ -521,6 +571,7 @@ Add task details and acceptance criteria here.
         verifier: Optional[str] = None,
         allow_self_approval: bool = False,
         session_id: Optional[str] = None,
+        evidence_paths: Optional[Sequence[str | Path]] = None,
     ) -> Tuple[bool, str]:
         """Mark task as done enforcing anti-self-approval when required."""
         self._validate_task_id(task_id)
@@ -565,13 +616,19 @@ Add task details and acceptance criteria here.
                     f"Self-approval forbidden: verifier '{verifier}' matches agent '{agent}' or claimant '{task.get('claimed_by')}'."
                 )
 
+        evidence_records: List[Dict[str, Any]] = []
+        if evidence_paths:
+            evidence_records = self._validate_and_hash_evidence(evidence_paths)
+
         seat = derive_seat(agent)
-        event_payload = {
+        event_payload: Dict[str, Any] = {
             "verifier": verifier,
             "implementer": implementer,
             "seat": seat,
             "session_id": session_id,
         }
+        if evidence_records:
+            event_payload["evidence"] = evidence_records
         version = task.get("version", 0)
 
         with self.get_queue_conn() as conn:

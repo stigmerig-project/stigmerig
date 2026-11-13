@@ -71,6 +71,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass anti-self-approval enforcement",
     )
     p_tdone.add_argument("--session-id", default=None, help="Optional session or run identifier")
+    p_tdone.add_argument(
+        "--evidence",
+        action="append",
+        default=None,
+        dest="evidence",
+        help="Repeatable path to evidence artifact to hash-bind on completion",
+    )
 
     p_tfail = task_sub.add_parser("fail", help="Mark a task as blocked or failed")
     p_tfail.add_argument("--id", required=True, help="Task ID")
@@ -166,6 +173,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     verifier=args.verifier,
                     allow_self_approval=args.allow_self_approval,
                     session_id=getattr(args, "session_id", None),
+                    evidence_paths=args.evidence,
                 )
                 if ok:
                     next_step = rig.get_next_workflow_step(args.id)
