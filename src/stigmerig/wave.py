@@ -9,9 +9,10 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from stigmerig.db import StigmeRigDB
+from stigmerig.db import StigmeRigDB, _is_self_approval
 
 STIGMERIG_SWARM_NAME = os.environ.get("STIGMERIG_SWARM_NAME", "StigmeRig Swarm")
+TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def get_git_repo_root(cwd: Optional[Path] = None) -> Optional[Path]:
@@ -56,11 +57,25 @@ class WorktreeManager:
         self.worktrees_dir = (worktrees_dir or (self.repo_root / ".worktrees")).resolve()
         self.swarm_name = swarm_name or os.environ.get("STIGMERIG_SWARM_NAME", STIGMERIG_SWARM_NAME)
 
+    def _resolve_worktree_target(self, task_id: str) -> Tuple[str, Path]:
+        raw = task_id.strip() if isinstance(task_id, str) else ""
+        if not TASK_ID_PATTERN.fullmatch(raw):
+            raise ValueError(f"Invalid task_id '{task_id}' for worktree operation")
+        clean_id = raw.upper()
+        base_resolved = self.worktrees_dir.resolve()
+        wt_path = (base_resolved / clean_id).resolve()
+        if (
+            wt_path == base_resolved
+            or not wt_path.is_relative_to(base_resolved)
+            or (base_resolved / clean_id).is_symlink()
+        ):
+            raise ValueError(f"Worktree path '{wt_path}' outside containment '{base_resolved}'")
+        return clean_id, wt_path
+
     def create_worktree(self, task_id: str) -> Path:
         """Create a dedicated worktree and branch for the task."""
-        clean_id = task_id.upper().strip()
+        clean_id, worktree_path = self._resolve_worktree_target(task_id)
         branch_name = f"task/{clean_id}"
-        worktree_path = self.worktrees_dir / clean_id
 
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
 
@@ -86,9 +101,8 @@ class WorktreeManager:
 
     def remove_worktree(self, task_id: str, delete_branch: bool = False) -> None:
         """Prune and remove worktree directory."""
-        clean_id = task_id.upper().strip()
+        clean_id, worktree_path = self._resolve_worktree_target(task_id)
         branch_name = f"task/{clean_id}"
-        worktree_path = self.worktrees_dir / clean_id
 
         if worktree_path.exists():
             subprocess.run(
@@ -117,15 +131,24 @@ class WorktreeManager:
 
     def merge_worktree(self, task_id: str, target_branch: Optional[str] = None) -> Tuple[bool, str]:
         """Merge task branch back into the target branch."""
-        clean_id = task_id.upper().strip()
+        clean_id, worktree_path = self._resolve_worktree_target(task_id)
         branch_name = f"task/{clean_id}"
         target = target_branch or get_active_branch(self.repo_root)
 
         # Check clean worktree first
-        worktree_path = self.worktrees_dir / clean_id
         if worktree_path.exists():
             status_res = subprocess.run(
-                ["git", "status", "--porcelain"],
+                [
+                    "git",
+                    "status",
+                    "--porcelain",
+                    "--",
+                    ".",
+                    ":(exclude).stigmerig",
+                    ":(exclude).stigmerig/**",
+                    ":(exclude)*.db-wal",
+                    ":(exclude)*.db-shm",
+                ],
                 cwd=str(worktree_path),
                 capture_output=True,
                 text=True,
@@ -201,7 +224,8 @@ class WaveRunner:
     ) -> Tuple[bool, str]:
         """Execute a single task inside an isolated worktree."""
         if not allow_self_approval:
-            if not (verifier and str(verifier).strip()) or verifier == agent:
+            clean_verifier = str(verifier).strip() if verifier is not None else ""
+            if not clean_verifier or _is_self_approval(agent, clean_verifier):
                 return False, "Independent verifier required unless allow_self_approval is True"
 
         claimed = self.db.claim_task(task_id, agent=agent)
@@ -227,7 +251,21 @@ class WaveRunner:
 
             if self.worktree_mgr and worktree_path:
                 # Commit any changes made inside worktree attributing to specific swarm archetype
-                subprocess.run(["git", "add", "."], cwd=str(worktree_path), capture_output=True, check=True)
+                subprocess.run(
+                    [
+                        "git",
+                        "add",
+                        "--all",
+                        "--",
+                        ":(exclude).stigmerig",
+                        ":(exclude).stigmerig/**",
+                        ":(exclude)*.db-wal",
+                        ":(exclude)*.db-shm",
+                    ],
+                    cwd=str(worktree_path),
+                    capture_output=True,
+                    check=True,
+                )
                 diff_proc = subprocess.run(
                     ["git", "diff", "--cached", "--quiet"],
                     cwd=str(worktree_path),
@@ -276,9 +314,10 @@ class WaveRunner:
             )
             return ok, comp_msg
         except Exception as exc:
-            self.db.fail_task(task_id, agent=agent, reason=str(exc))
-            if self.worktree_mgr and worktree_path:
-                self.worktree_mgr.remove_worktree(task_id)
+            try:
+                self.db.fail_task(task_id, agent=agent, reason=str(exc))
+            except Exception:
+                pass
             return False, f"Task error: {exc}"
 
     def run_wave(

@@ -3,6 +3,7 @@
 import concurrent.futures
 import datetime
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -570,3 +571,214 @@ def test_cli_uninitialized_and_duplicate_error_handling(tmp_path: Path, capsys):
     assert c2 == 1
     err2 = capsys.readouterr().err
     assert "[ERROR]" in err2
+
+
+def test_task_id_traversal_and_validation_f01(temp_rig: StigmeRigDB, capsys):
+    """Verify F-01: task_id traversal and malformed IDs raise ValueError across core operations and CLI."""
+    invalid_ids = ["..", "../pwn", "a/b", "task/escape", "TSK with space", ".hidden", "a" * 65]
+
+    for bad_id in invalid_ids:
+        with pytest.raises(ValueError) as exc_get:
+            temp_rig.get_task_file(bad_id)
+        assert "Invalid task_id" in str(exc_get.value)
+
+        with pytest.raises(ValueError) as exc_create:
+            temp_rig.create_task(bad_id, "Bad Title")
+        assert "Invalid task_id" in str(exc_create.value)
+
+        with pytest.raises(ValueError) as exc_claim:
+            temp_rig.claim_task(bad_id, agent="AgentA")
+        assert "Invalid task_id" in str(exc_claim.value)
+
+        with pytest.raises(ValueError) as exc_done:
+            temp_rig.complete_task(bad_id, agent="AgentA", allow_self_approval=True)
+        assert "Invalid task_id" in str(exc_done.value)
+
+        with pytest.raises(ValueError) as exc_fail:
+            temp_rig.fail_task(bad_id, agent="AgentA", reason="Bad ID fail")
+        assert "Invalid task_id" in str(exc_fail.value)
+
+    # CLI test for task_id traversal error handling
+    code = main([
+        "--rig-dir", str(temp_rig.rig_dir),
+        "task", "create",
+        "--id", "../bad-id",
+        "--title", "Traversal Task",
+    ])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "[ERROR]" in err
+    assert "Invalid task_id" in err
+
+
+def test_lease_bound_cas_and_stale_claimant_f02(temp_rig: StigmeRigDB):
+    """Verify F-02: Stale claimants cannot complete or fail actively leased tasks; CAS prevents split-brain."""
+    # 1. Unclaimed todo task cannot be completed directly
+    temp_rig.create_task("TSK-TODO-COMP", "Unclaimed Todo Task")
+    ok_unclaimed, msg_unclaimed = temp_rig.complete_task(
+        "TSK-TODO-COMP",
+        agent="AgentA",
+        allow_self_approval=True,
+    )
+    assert ok_unclaimed is False
+    assert "must be 'working'" in msg_unclaimed
+
+    # 2. Unclaimed todo task can still be failed to 'blocked' (preserves L500 invariant)
+    temp_rig.create_task("TSK-TODO-FAIL", "Unclaimed Fail Task")
+    ok_fail_todo = temp_rig.fail_task("TSK-TODO-FAIL", agent="AgentA", reason="Blocked on discovery")
+    assert ok_fail_todo is True
+    t_failed = temp_rig.get_task("TSK-TODO-FAIL")
+    assert t_failed["status"] == "blocked"
+
+    # 3. Active lease stolen after timeout: stale claimant rejected from complete_task & fail_task
+    temp_rig.create_task("TSK-STALE-LOCK", "Stale Lock Task")
+    claimed_a = temp_rig.claim_task("TSK-STALE-LOCK", agent="AgentA", ttl_seconds=10)
+    assert claimed_a is True
+
+    # Artificially expire AgentA's lease in SQLite
+    past_time = "2020-01-01T00:00:00Z"
+    with temp_rig.get_queue_conn() as conn:
+        conn.execute("UPDATE tasks SET lease_until = ? WHERE id = 'TSK-STALE-LOCK'", (past_time,))
+        conn.commit()
+
+    # AgentB reclaims the expired task
+    claimed_b = temp_rig.claim_task("TSK-STALE-LOCK", agent="AgentB", ttl_seconds=3600)
+    assert claimed_b is True
+    assert temp_rig.get_task("TSK-STALE-LOCK")["claimed_by"] == "AgentB"
+
+    # Stale AgentA attempts complete_task -> rejected with False, AgentB state preserved
+    ok_stale_comp, msg_stale_comp = temp_rig.complete_task(
+        "TSK-STALE-LOCK",
+        agent="AgentA",
+        verifier="VerifierX",
+    )
+    assert ok_stale_comp is False
+    assert "AgentB" in msg_stale_comp or "not 'AgentA'" in msg_stale_comp
+    assert temp_rig.get_task("TSK-STALE-LOCK")["status"] == "working"
+    assert temp_rig.get_task("TSK-STALE-LOCK")["claimed_by"] == "AgentB"
+
+    # Stale AgentA attempts fail_task -> raises PermissionError, AgentB state preserved
+    with pytest.raises(PermissionError) as exc_fail_stale:
+        temp_rig.fail_task("TSK-STALE-LOCK", agent="AgentA", reason="AgentA thinks it failed")
+    assert "actively leased by 'AgentB'" in str(exc_fail_stale.value)
+    assert temp_rig.get_task("TSK-STALE-LOCK")["status"] == "working"
+    assert temp_rig.get_task("TSK-STALE-LOCK")["claimed_by"] == "AgentB"
+
+    # Valid AgentB completes the task
+    ok_b_done, _ = temp_rig.complete_task(
+        "TSK-STALE-LOCK",
+        agent="AgentB",
+        verifier="VerifierX",
+    )
+    assert ok_b_done is True
+    assert temp_rig.get_task("TSK-STALE-LOCK")["status"] == "done"
+
+    # Attempting to fail a terminal (done) task raises PermissionError
+    with pytest.raises(PermissionError) as exc_done_fail:
+        temp_rig.fail_task("TSK-STALE-LOCK", agent="AgentA", reason="Fail after done")
+    assert "terminal status 'done'" in str(exc_done_fail.value)
+
+
+def test_epic_open_child_guard_d3_04(temp_rig: StigmeRigDB):
+    """Verify D3-04: Cannot complete parent/epic tasks while open child tasks remain."""
+    temp_rig.create_task("EPC-PARENT", "Parent Epic Task")
+    temp_rig.create_task("TSK-CHILD-1", "Child Task 1", parent_id="EPC-PARENT")
+    temp_rig.create_task("TSK-CHILD-2", "Child Task 2", parent_id="EPC-PARENT")
+
+    temp_rig.claim_task("EPC-PARENT", agent="EpicLead")
+
+    # Complete epic blocked while both children are in 'todo'
+    ok, msg = temp_rig.complete_task("EPC-PARENT", agent="EpicLead", verifier="VerifierLead")
+    assert ok is False
+    assert "Cannot complete EPC-PARENT: open child tasks remain" in msg
+    assert "TSK-CHILD-1" in msg and "TSK-CHILD-2" in msg
+    assert temp_rig.get_task("EPC-PARENT")["status"] == "working"
+
+    # Complete child 1; child 2 remains todo -> still blocked
+    temp_rig.claim_task("TSK-CHILD-1", agent="Worker1")
+    temp_rig.complete_task("TSK-CHILD-1", agent="Worker1", verifier="Verifier1")
+
+    ok2, msg2 = temp_rig.complete_task("EPC-PARENT", agent="EpicLead", verifier="VerifierLead")
+    assert ok2 is False
+    assert "open child tasks remain (TSK-CHILD-2)" in msg2
+
+    # Put child 2 in 'blocked' -> still open, completion still blocked
+    temp_rig.fail_task("TSK-CHILD-2", agent="Worker2", reason="Waiting on API")
+    ok3, msg3 = temp_rig.complete_task("EPC-PARENT", agent="EpicLead", verifier="VerifierLead")
+    assert ok3 is False
+    assert "open child tasks remain (TSK-CHILD-2)" in msg3
+
+    # Mark child 2 cancelled directly in SQLite to simulate terminal resolution
+    with temp_rig.get_queue_conn() as conn:
+        conn.execute("UPDATE tasks SET status = 'cancelled' WHERE id = 'TSK-CHILD-2'")
+        conn.commit()
+
+    # Now all children are in terminal status ('done', 'cancelled') -> epic can complete
+    ok4, msg4 = temp_rig.complete_task("EPC-PARENT", agent="EpicLead", verifier="VerifierLead")
+    assert ok4 is True
+    assert temp_rig.get_task("EPC-PARENT")["status"] == "done"
+
+
+def test_sync_board_markdown_escaping_f05(temp_rig: StigmeRigDB):
+    """Verify F-05: sync_board escapes pipes and newlines so Task_Board.md columns remain intact."""
+    temp_rig.create_task(
+        "TSK-ESC-1",
+        title="Feature with | pipe and \n newline \r\n second line",
+    )
+    temp_rig.claim_task("TSK-ESC-1", agent="Worker|Special\nSeat")
+
+    board_path = temp_rig.sync_board()
+    assert board_path.exists()
+    content = board_path.read_text(encoding="utf-8")
+
+    matching_rows = [line for line in content.splitlines() if line.startswith("| `TSK-ESC-1`")]
+    assert len(matching_rows) == 1
+    row = matching_rows[0]
+
+    # Must contain escaped pipe
+    assert r"\|" in row
+    # Must not contain unescaped raw newlines in cell
+    assert "\n" not in row
+    assert "\r" not in row
+
+    # In a 5-column table, splitting by unescaped pipe should yield exactly 7 tokens (empty before 1st pipe + 5 columns + empty after last pipe)
+    unescaped_pipes = [m.start() for m in re.finditer(r"(?<!\\)\|", row)]
+    assert len(unescaped_pipes) == 6, f"Expected 6 unescaped table delimiter pipes, found {len(unescaped_pipes)} in: {row}"
+
+
+def test_cli_permission_and_value_errors(temp_rig: StigmeRigDB, capsys):
+    """Verify CLI catches ValueError and PermissionError across commands and returns 1 with stderr."""
+    rig_arg = ["--rig-dir", str(temp_rig.rig_dir)]
+
+    # 1. Invalid task ID in claim
+    code = main(rig_arg + ["task", "claim", "--id", "../bad", "--agent", "AgentX"])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "[ERROR]" in err
+    assert "Invalid task_id" in err
+
+    # 2. Invalid task ID in done
+    code = main(rig_arg + ["task", "done", "--id", "../bad", "--agent", "AgentX", "--verifier", "VerifierY"])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "[ERROR]" in err
+    assert "Invalid task_id" in err
+
+    # 3. Invalid task ID in fail
+    code = main(rig_arg + ["task", "fail", "--id", "../bad", "--agent", "AgentX", "--reason", "Test"])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "[ERROR]" in err
+    assert "Invalid task_id" in err
+
+    # 4. PermissionError in fail when task is actively leased by another agent
+    temp_rig.create_task("TSK-CLI-FAIL-PERM", "Active Task")
+    temp_rig.claim_task("TSK-CLI-FAIL-PERM", agent="AgentOwner", ttl_seconds=3600)
+
+    code = main(rig_arg + ["task", "fail", "--id", "TSK-CLI-FAIL-PERM", "--agent", "AgentStale", "--reason", "Hijack"])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "[ERROR]" in err
+    assert "actively leased by 'AgentOwner'" in err
+
+

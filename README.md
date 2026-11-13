@@ -63,6 +63,15 @@ StigmeRig implements controls aligned with federal and international software as
   - `AU-2 / AU-3 / AU-9`: Protection of audit information via append-only cryptographic hash chains.
   - `AU-10`: Non-repudiation of agent claims and verification receipts.
 
+## Security and Concurrency Invariants (v0.1.4)
+
+StigmeRig enforces four operational security and concurrency invariants across all execution workflows:
+
+- **Lease-Bound Compare-And-Swap (`CAS`) Transitions**: `complete_task` and `fail_task` verify active `working` lease ownership, unexpired `lease_until` timestamps, and `version` compare-and-swap checks. Parent epics also verify open child-task completion before closing.
+- **Resolved Path Containment**: Task identifiers must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`. Task files and `.worktrees/<TASK_ID>` directories enforce resolved `Path.is_relative_to()` containment.
+- **Forensic Worktree Retention**: When a `WaveRunner` task action or commit raises an exception, StigmeRig marks the task `blocked`. The runner retains the isolated worktree on disk for inspection instead of deleting uncommitted changes.
+- **Cooperative Trust Boundary**: CLI flags such as `--agent` and `--verifier` enforce workflow separation across cooperative local agents. They do not provide cryptographic authentication against untrusted operating system adversaries.
+
 ## Core Features
 
 - **Local-First SQLite WAL State**: Coordinates concurrent readers and writers in `.stigmerig/queue.db` with zero network brokers.
@@ -80,11 +89,11 @@ StigmeRig implements controls aligned with federal and international software as
 Install StigmeRig directly from GitHub using pip or uv:
 
 ```bash
-pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.3"
+pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.4"
 ```
 
 ```bash
-uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.3"
+uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.4"
 ```
 
 Alternatively, clone the repository for editable local development:

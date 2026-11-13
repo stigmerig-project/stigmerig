@@ -185,6 +185,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if ok:
                     print(f"Task {args.id} marked blocked: {args.reason}")
                     return 0
+                print(f"Failed to mark task {args.id} blocked", file=sys.stderr)
                 return 1
 
         if args.command == "audit":

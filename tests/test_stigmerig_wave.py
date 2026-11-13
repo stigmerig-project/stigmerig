@@ -537,3 +537,146 @@ def test_fail_task_trap_deduplication_and_cli_metrics_json(tmp_path: Path, capsy
     assert file_payload["governance_and_topology"]["blocked_reasons"]["total_traps"] == 1
 
 
+def test_worktree_manager_task_id_validation_and_containment(git_repo: Path):
+    """Verify WorktreeManager raises ValueError on invalid or escaping task IDs."""
+    wt_mgr = WorktreeManager(repo_root=git_repo)
+    invalid_ids = ["..", ".", "../escape", "foo/bar", ""]
+
+    readme = git_repo / "README.md"
+    assert readme.exists()
+
+    for invalid in invalid_ids:
+        with pytest.raises(ValueError):
+            wt_mgr.create_worktree(invalid)
+        with pytest.raises(ValueError):
+            wt_mgr.remove_worktree(invalid)
+        with pytest.raises(ValueError):
+            wt_mgr.merge_worktree(invalid)
+
+    # Verify repo_root and files remain completely intact
+    assert git_repo.exists()
+    assert readme.exists()
+    assert readme.read_text(encoding="utf-8") == "# Test Repo\n"
+
+
+def test_worktree_preserved_on_action_exception(git_repo: Path):
+    """Verify worktree directory and uncommitted work are preserved when task raises."""
+    rig_dir = git_repo / ".stigmerig"
+    db = StigmeRigDB(rig_dir=rig_dir)
+    db.init_rig()
+
+    wt_mgr = WorktreeManager(repo_root=git_repo)
+    runner = WaveRunner(db=db, worktree_mgr=wt_mgr)
+
+    task_id = "TSK-FAIL-1"
+    db.create_task(task_id=task_id, title="Failing task", author="Boss")
+
+    expected_worktree = wt_mgr.worktrees_dir / task_id
+
+    def failing_action(worktree_dir: Path) -> bool:
+        uncommitted = worktree_dir / "uncommitted_work.txt"
+        uncommitted.write_text("precious worker code", encoding="utf-8")
+        raise RuntimeError("boom")
+
+    ok, msg = runner.run_task_in_worktree(
+        task_id=task_id,
+        agent="WorkerA",
+        action_fn=failing_action,
+        verifier="VerifierB",
+    )
+
+    assert ok is False
+    assert "boom" in msg
+    task = db.get_task(task_id)
+    assert task is not None
+    assert task["status"] == "blocked"
+    assert expected_worktree.exists()
+    uncommitted_file = expected_worktree / "uncommitted_work.txt"
+    assert uncommitted_file.exists()
+    assert uncommitted_file.read_text(encoding="utf-8") == "precious worker code"
+
+
+def test_pre_claim_self_approval_rejection_normalized(git_repo: Path):
+    """Verify normalized self-approval is rejected before claiming or creating worktree."""
+    rig_dir = git_repo / ".stigmerig"
+    db = StigmeRigDB(rig_dir=rig_dir)
+    db.init_rig()
+
+    wt_mgr = WorktreeManager(repo_root=git_repo)
+    runner = WaveRunner(db=db, worktree_mgr=wt_mgr)
+
+    task_id = "TSK-SELF-NORM"
+    db.create_task(task_id=task_id, title="Self approval normalized", author="Architect")
+
+    worktree_path = wt_mgr.worktrees_dir / task_id
+
+    ok, msg = runner.run_task_in_worktree(
+        task_id=task_id,
+        agent="Claude-Opus",
+        action_fn=lambda p: True,
+        verifier="claude-opus",
+        allow_self_approval=False,
+    )
+
+    assert ok is False
+    assert "Independent verifier required unless allow_self_approval is True" in msg
+    task = db.get_task(task_id)
+    assert task is not None
+    assert task["status"] == "todo"
+    assert not worktree_path.exists()
+
+
+def test_scoped_git_staging_excludes_stigmerig_and_sqlite(git_repo: Path):
+    """Verify scoped git staging excludes .stigmerig and sqlite wal/shm artifacts."""
+    rig_dir = git_repo / ".stigmerig"
+    db = StigmeRigDB(rig_dir=rig_dir)
+    db.init_rig()
+
+    wt_mgr = WorktreeManager(repo_root=git_repo)
+    runner = WaveRunner(db=db, worktree_mgr=wt_mgr)
+
+    task_id = "TSK-STAGE-1"
+    db.create_task(task_id=task_id, title="Staging exclusion test", author="Architect")
+
+    def action_fn(worktree_dir: Path) -> bool:
+        # Write valid file
+        (worktree_dir / "valid_code.py").write_text("print('hello')", encoding="utf-8")
+        # Write excluded artifacts
+        stig_dir = worktree_dir / ".stigmerig"
+        stig_dir.mkdir(parents=True, exist_ok=True)
+        (stig_dir / "temp_queue.db").write_text("sqlite db data", encoding="utf-8")
+        (worktree_dir / "audit.db-wal").write_text("wal data", encoding="utf-8")
+        (worktree_dir / "audit.db-shm").write_text("shm data", encoding="utf-8")
+        return True
+
+    ok, msg = runner.run_task_in_worktree(
+        task_id=task_id,
+        agent="WorkerA",
+        action_fn=action_fn,
+        verifier="VerifierB",
+    )
+
+    assert ok is True, f"Task failed: {msg}"
+    task = db.get_task(task_id)
+    assert task["status"] == "done"
+
+    # Verify committed files on main branch
+    main_valid = git_repo / "valid_code.py"
+    assert main_valid.exists()
+
+    # Verify excluded files are not present in commit tree of main
+    ls_files = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+        cwd=str(git_repo),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+
+    assert "valid_code.py" in ls_files
+    assert ".stigmerig/temp_queue.db" not in ls_files
+    assert "audit.db-wal" not in ls_files
+    assert "audit.db-shm" not in ls_files
+
+
+

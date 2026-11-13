@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 GENESIS_HASH: str = "0" * 64
 WORKFLOW_RAILS: Tuple[str, ...] = ("diff_synthesizer", "unit_tester", "policy_gatekeeper")
+TASK_ID_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _TRAP_STOP_WORDS: frozenset[str] = frozenset({
     "with", "from", "that", "this", "have", "been", "were", "when", "what",
     "where", "which", "while", "into", "onto", "upon", "over", "under",
@@ -119,6 +120,15 @@ def _is_self_approval(actor: Optional[str], verifier: Optional[str]) -> bool:
 def utc_now_iso() -> str:
     """Return current UTC time in ISO format."""
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _escape_md_cell(value: Any) -> str:
+    """Escape markdown table cell values to prevent breaking column layout."""
+    if value is None:
+        return ""
+    text = str(value)
+    text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return text.replace("|", r"\|")
 
 
 def resolve_rig_dir(override: Optional[Path | str] = None) -> Path:
@@ -288,15 +298,37 @@ class StigmeRigDB:
         finally:
             conn.close()
 
+    def _validate_task_id(self, task_id: str) -> str:
+        """Validate task identifier syntax preventing directory traversal."""
+        if not isinstance(task_id, str) or not TASK_ID_PATTERN.fullmatch(task_id):
+            raise ValueError(f"Invalid task_id '{task_id}': must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$")
+        return task_id
+
     def get_task_file(self, task_id: str) -> Path:
         """Resolve task markdown file supporting both flat tasks/<ID>.md and nested tasks/<ID>/context.md."""
+        self._validate_task_id(task_id)
+        tasks_root = self.tasks_dir.resolve()
         nested = self.tasks_dir / task_id / "context.md"
-        if nested.exists():
-            return nested
         flat = self.tasks_dir / f"{task_id}.md"
-        if flat.exists():
-            return flat
-        return nested if (self.tasks_dir / task_id).is_dir() else flat
+
+        if nested.exists():
+            candidate = nested
+        elif flat.exists():
+            candidate = flat
+        else:
+            candidate = nested if (self.tasks_dir / task_id).is_dir() else flat
+
+        resolved_candidate = candidate.resolve()
+        try:
+            if not resolved_candidate.is_relative_to(tasks_root):
+                raise ValueError(f"Task file traversal detected: '{candidate}' escapes '{tasks_root}'")
+        except (ValueError, AttributeError):
+            raise ValueError(f"Task file traversal detected: '{candidate}' escapes '{tasks_root}'")
+
+        if candidate.is_symlink() and not candidate.resolve().is_relative_to(tasks_root):
+            raise ValueError(f"Task symlink escapes tasks directory: '{candidate}'")
+
+        return candidate
 
     def create_task(
         self,
@@ -309,9 +341,14 @@ class StigmeRigDB:
         priority: int = 100,
     ) -> Dict[str, Any]:
         """Create a new task record in SQLite and write its markdown scaffold."""
+        self._validate_task_id(task_id)
         now = utc_now_iso()
         task_file = self.get_task_file(task_id)
-        context_path = str(task_file.relative_to(self.rig_dir.parent))
+        tasks_root = self.tasks_dir.resolve()
+        resolved_file = task_file.resolve()
+        if not resolved_file.is_relative_to(tasks_root):
+            raise ValueError(f"Task file traversal detected: '{task_file}' escapes '{tasks_root}'")
+        context_path = str(resolved_file.relative_to(self.rig_dir.parent.resolve()))
 
         with self.get_queue_conn() as conn:
             conn.execute(
@@ -334,6 +371,7 @@ class StigmeRigDB:
             conn.commit()
 
         if not task_file.exists():
+            task_file.parent.mkdir(parents=True, exist_ok=True)
             scaffold = f"""# {task_id}: {title}
 
 - **Parent**: {parent_id or "None"}
@@ -402,6 +440,7 @@ Add task details and acceptance criteria here.
         2. Task is either unclaimed, expired, or already claimed by the same agent.
         3. The version in the DB matches the in-memory read version.
         """
+        self._validate_task_id(task_id)
         task = self.get_task(task_id)
         if not task:
             return False
@@ -484,12 +523,35 @@ Add task details and acceptance criteria here.
         session_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Mark task as done enforcing anti-self-approval when required."""
+        self._validate_task_id(task_id)
         task = self.get_task(task_id)
         if not task:
             return False, f"Task {task_id} not found"
 
         if task["status"] == "done":
             return True, f"Task {task_id} already completed"
+
+        # D3-04: Open child guard
+        with self.get_queue_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, status FROM tasks WHERE parent_id = ? AND status NOT IN ('done', 'cancelled', 'canceled', 'archived')",
+                (task_id,),
+            )
+            open_children = [dict(r) for r in cur.fetchall()]
+        if open_children:
+            child_ids = ", ".join(r["id"] for r in open_children)
+            return False, f"Cannot complete {task_id}: open child tasks remain ({child_ids})"
+
+        now = utc_now_iso()
+
+        # F-02: Active lease ownership check
+        if task["status"] != "working":
+            return False, f"Cannot complete task '{task_id}': status is '{task['status']}' (must be 'working')"
+        if task.get("claimed_by") != agent:
+            return False, f"Cannot complete task '{task_id}': claimed by '{task.get('claimed_by')}', not '{agent}'"
+        if task.get("lease_until") is not None and task.get("lease_until") < now:
+            return False, f"Cannot complete task '{task_id}': lease expired at {task.get('lease_until')}"
 
         implementer = task.get("claimed_by") or agent
 
@@ -503,7 +565,6 @@ Add task details and acceptance criteria here.
                     f"Self-approval forbidden: verifier '{verifier}' matches agent '{agent}' or claimant '{task.get('claimed_by')}'."
                 )
 
-        now = utc_now_iso()
         seat = derive_seat(agent)
         event_payload = {
             "verifier": verifier,
@@ -511,6 +572,8 @@ Add task details and acceptance criteria here.
             "seat": seat,
             "session_id": session_id,
         }
+        version = task.get("version", 0)
+
         with self.get_queue_conn() as conn:
             cur = conn.cursor()
             cur.execute(
@@ -521,9 +584,16 @@ Add task details and acceptance criteria here.
                     version = version + 1,
                     updated_at = ?
                 WHERE id = ?
+                  AND status = 'working'
+                  AND claimed_by = ?
+                  AND version = ?
+                  AND (lease_until IS NULL OR lease_until >= ?)
                 """,
-                (now, task_id),
+                (now, task_id, agent, version, now),
             )
+            if cur.rowcount != 1:
+                return False, f"Concurrent modification detected or lease lost on task '{task_id}' (expected version {version})"
+
             conn.execute(
                 """
                 INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
@@ -600,22 +670,65 @@ Add task details and acceptance criteria here.
 
     def fail_task(self, task_id: str, agent: str, reason: str) -> bool:
         """Mark task as blocked or failed."""
+        self._validate_task_id(task_id)
+        task = self.get_task(task_id)
+        if not task:
+            raise KeyError(f"Task '{task_id}' not found.")
+
         now = utc_now_iso()
+        expected_version = task.get("version", 0)
+
+        # Block terminal overwrites
+        if task["status"] in ("done", "cancelled", "canceled", "archived"):
+            raise PermissionError(f"Cannot fail task '{task_id}' in terminal status '{task['status']}'.")
+
+        # Block stale-claimant split-brain overwrites (F-02)
+        if (
+            task["status"] == "working"
+            and task.get("claimed_by") != agent
+            and task.get("lease_until")
+            and task.get("lease_until") >= now
+        ):
+            raise PermissionError(
+                f"Task '{task_id}' is actively leased by '{task.get('claimed_by')}'; '{agent}' cannot fail it."
+            )
+
         with self.get_queue_conn() as conn:
             cur = conn.cursor()
-            cur.execute(
-                """
-                UPDATE tasks
-                SET status = 'blocked',
-                    lease_until = NULL,
-                    version = version + 1,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (now, task_id),
-            )
-            if cur.rowcount == 0:
-                raise KeyError(f"Task '{task_id}' not found.")
+            if task["status"] == "todo" and task.get("claimed_by") is None:
+                cur.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'blocked',
+                        lease_until = NULL,
+                        version = version + 1,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND version = ?
+                      AND status = 'todo'
+                      AND claimed_by IS NULL
+                    """,
+                    (now, task_id, expected_version),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'blocked',
+                        lease_until = NULL,
+                        version = version + 1,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND version = ?
+                    """,
+                    (now, task_id, expected_version),
+                )
+
+            if cur.rowcount != 1:
+                raise PermissionError(
+                    f"Concurrent modification detected on task '{task_id}' (expected version {expected_version})."
+                )
+
             conn.execute(
                 """
                 INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
@@ -863,9 +976,12 @@ Add task details and acceptance criteria here.
                 content.append("| ID | Title | Archetype | Claimant | Updated |")
                 content.append("| :--- | :--- | :--- | :--- | :--- |")
                 for item in items:
-                    claimant = item.get("claimed_by") or "-"
-                    arch = item.get("archetype") or "diff_synthesizer"
-                    content.append(f"| `{item['id']}` | {item['title']} | `{arch}` | {claimant} | {item['updated_at']} |")
+                    claimant = _escape_md_cell(item.get("claimed_by") or "-")
+                    arch = _escape_md_cell(item.get("archetype") or "diff_synthesizer")
+                    clean_id = _escape_md_cell(item["id"])
+                    clean_title = _escape_md_cell(item["title"])
+                    clean_updated = _escape_md_cell(item["updated_at"])
+                    content.append(f"| `{clean_id}` | {clean_title} | `{arch}` | {claimant} | {clean_updated} |")
             content.append("")
 
         self.board_path.write_text("\n".join(content) + "\n", encoding="utf-8")
