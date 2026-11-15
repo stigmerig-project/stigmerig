@@ -6,14 +6,49 @@ from contextlib import contextmanager
 import datetime
 import hashlib
 import json
+import logging
+import math
 import os
 import re
 import sqlite3
+import stat
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 GENESIS_HASH: str = "0" * 64
+SHA256_HEX_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-fA-F]{64}$")
+TIER_B_AUDIT_MARKERS: frozenset[str] = frozenset({"entry_hash", "payload_hash", "verification_status"})
+_LINK_REPARSE_TAGS: frozenset[int] = frozenset({
+    getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C),
+    getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003),
+})
+_RIG_LOCKS_GUARD = threading.Lock()
+_RIG_LOCKS: Dict[str, threading.RLock] = {}
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+        return True
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or (getattr(st, "st_reparse_tag", 0) in _LINK_REPARSE_TAGS)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
 WORKFLOW_RAILS: Tuple[str, ...] = ("diff_synthesizer", "unit_tester", "policy_gatekeeper")
 TASK_ID_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _TRAP_STOP_WORDS: frozenset[str] = frozenset({
@@ -122,6 +157,30 @@ def utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+UTC_ISO_TIMESTAMP_PATTERN: re.Pattern[str] = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+
+
+def _is_canonical_utc_iso(value: str) -> bool:
+    if not isinstance(value, str) or not UTC_ISO_TIMESTAMP_PATTERN.fullmatch(value):
+        return False
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_audit_header_fields(task_id: str, action: str, agent: str, verification_status: str) -> Optional[str]:
+    if not isinstance(task_id, str) or not TASK_ID_PATTERN.fullmatch(task_id):
+        return f"invalid task_id {task_id!r}"
+    if not isinstance(agent, str) or not agent.strip() or not agent.isprintable():
+        return "agent must be non-empty"
+    for name, val in (("action", action), ("verification_status", verification_status)):
+        if not isinstance(val, str) or not val.strip() or ":" in val or not val.isprintable():
+            return f"invalid {name}"
+    return None
+
+
 def _escape_md_cell(value: Any) -> str:
     """Escape markdown table cell values to prevent breaking column layout."""
     if value is None:
@@ -150,12 +209,21 @@ def resolve_rig_dir(override: Optional[Path | str] = None) -> Path:
 class StigmeRigDB:
     """Manages SQLite WAL queue, WORM audit chain, and markdown task files."""
 
-    def __init__(self, rig_dir: Optional[Path | str] = None):
+    def __init__(
+        self,
+        rig_dir: Optional[Path | str] = None,
+        workspace_root: Optional[Path | str] = None,
+    ):
         self.rig_dir = resolve_rig_dir(rig_dir)
+        self.workspace_root: Optional[Path] = (
+            Path(workspace_root).resolve() if workspace_root else None
+        )
         self.queue_db_path = self.rig_dir / "queue.db"
         self.audit_db_path = self.rig_dir / "audit.db"
         self.tasks_dir = self.rig_dir / "tasks"
         self.board_path = self.rig_dir / "Task_Board.md"
+        with _RIG_LOCKS_GUARD:
+            self._lock = _RIG_LOCKS.setdefault(str(self.rig_dir), threading.RLock())
 
     def init_rig(self, scaffold_icm: bool = True) -> Optional[str]:
         """Initialize directory layout, SQLite databases with WAL pragmas, and ICM scaffolding."""
@@ -196,6 +264,12 @@ class StigmeRigDB:
                     timestamp TEXT NOT NULL
                 );
             """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_status_priority_created_id "
+                "ON tasks(status, priority, created_at, id);"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent_status ON tasks(parent_id, status);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_task_events_task_id ON task_events(task_id, id);")
             conn.commit()
 
         with self.get_audit_conn() as conn:
@@ -212,6 +286,15 @@ class StigmeRigDB:
                     entry_hash TEXT NOT NULL
                 );
             """)
+            audit_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(audit_log)").fetchall()
+            }
+            if "entry_hash" not in audit_cols:
+                raise RuntimeError(
+                    f"Legacy audit_log schema detected in {self.audit_db_path} "
+                    "(missing 'entry_hash'). Pass --rig-dir to use an isolated v2 "
+                    "state directory or archive the legacy audit.db."
+                )
             conn.execute("""
                 CREATE TRIGGER IF NOT EXISTS prevent_audit_delete
                 BEFORE DELETE ON audit_log
@@ -235,6 +318,14 @@ class StigmeRigDB:
                         (SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1),
                         '{GENESIS_HASH}'
                     );
+                END;
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS enforce_contiguous_audit_id
+                AFTER INSERT ON audit_log
+                BEGIN
+                    SELECT RAISE(ABORT, 'Audit ID break: id must be contiguous 1..N')
+                    WHERE NEW.id < 1 OR NEW.id IS NOT (SELECT COUNT(*) FROM audit_log);
                 END;
             """)
             conn.commit()
@@ -276,11 +367,11 @@ class StigmeRigDB:
     def get_queue_conn(self):
         """Create a connection to queue.db with WAL pragmas, closing on context exit."""
         conn = sqlite3.connect(str(self.queue_db_path), timeout=5.0)
-        conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("PRAGMA synchronous = NORMAL;")
-        conn.execute("PRAGMA busy_timeout = 5000;")
-        conn.row_factory = sqlite3.Row
         try:
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.execute("PRAGMA busy_timeout = 5000;")
+            conn.row_factory = sqlite3.Row
             yield conn
         finally:
             conn.close()
@@ -289,14 +380,33 @@ class StigmeRigDB:
     def get_audit_conn(self):
         """Create a connection to audit.db with WAL pragmas, closing on context exit."""
         conn = sqlite3.connect(str(self.audit_db_path), timeout=5.0)
-        conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("PRAGMA synchronous = NORMAL;")
-        conn.execute("PRAGMA busy_timeout = 5000;")
-        conn.row_factory = sqlite3.Row
         try:
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.execute("PRAGMA busy_timeout = 5000;")
+            conn.row_factory = sqlite3.Row
             yield conn
         finally:
             conn.close()
+
+    def _ensure_queue_ready(self) -> None:
+        if not self.queue_db_path.is_file():
+            raise FileNotFoundError(f"Uninitialized queue database: {self.queue_db_path}; run 'stigmerig init'")
+        with self.get_queue_conn() as conn:
+            rows = {
+                r["name"]: r["sql"] or ""
+                for r in conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('tasks', 'task_events')")
+            }
+            if any(t not in rows or re.search(r"\bVIRTUAL\s+TABLE\b", rows[t], re.IGNORECASE) for t in ("tasks", "task_events")):
+                raise sqlite3.OperationalError("tasks and task_events must be non-virtual base tables")
+
+    def _ensure_audit_ready(self) -> None:
+        if not self.audit_db_path.is_file():
+            raise FileNotFoundError(f"Uninitialized audit database: {self.audit_db_path}")
+        with self.get_audit_conn() as conn:
+            row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_log'").fetchone()
+            if not row or "VIRTUAL TABLE" in (row["sql"] or "").upper():
+                raise sqlite3.OperationalError("audit_log must be a non-virtual base table")
 
     def _validate_task_id(self, task_id: str) -> str:
         """Validate task identifier syntax preventing directory traversal."""
@@ -342,6 +452,20 @@ class StigmeRigDB:
     ) -> Dict[str, Any]:
         """Create a new task record in SQLite and write its markdown scaffold."""
         self._validate_task_id(task_id)
+        if not isinstance(title, str) or not title.strip() or not title.replace("\t", " ").replace("\n", " ").replace("\r", " ").isprintable():
+            raise ValueError("Invalid title: must be a non-empty string without control characters")
+        if not isinstance(archetype, str) or not archetype.strip() or not archetype.isprintable():
+            raise ValueError("Invalid archetype: must be a non-empty printable string")
+        if isinstance(priority, bool) or not isinstance(priority, int) or not (-(1 << 63) <= priority < (1 << 63)):
+            raise ValueError("Invalid priority: must be a 64-bit signed integer")
+        if parent_id is not None and (not isinstance(parent_id, str) or not TASK_ID_PATTERN.fullmatch(parent_id) or parent_id == task_id):
+            raise ValueError(f"Invalid parent_id {parent_id!r}: must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$ and not reference itself")
+        if author is not None and (not isinstance(author, str) or not author.strip() or not author.isprintable()):
+            raise ValueError("Invalid author: must be a non-empty printable string")
+        if tags is not None and (not isinstance(tags, str) or not tags.isprintable() or any(not seg.strip() for seg in tags.split(","))):
+            raise ValueError("Invalid tags: must be comma-separated non-empty printable segments")
+        self._ensure_queue_ready()
+        self._ensure_audit_ready()
         now = utc_now_iso()
         task_file = self.get_task_file(task_id)
         tasks_root = self.tasks_dir.resolve()
@@ -351,16 +475,21 @@ class StigmeRigDB:
         context_path = str(resolved_file.relative_to(self.rig_dir.parent.resolve()))
 
         with self.get_queue_conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO tasks (
-                    id, title, status, priority, created_at, updated_at,
-                    claimed_by, lease_until, version, context_path,
-                    parent_id, tags, author, archetype
-                ) VALUES (?, ?, 'todo', ?, ?, ?, NULL, NULL, 0, ?, ?, ?, ?, ?)
-                """,
-                (task_id, title, priority, now, now, context_path, parent_id, tags, author, archetype),
-            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO tasks (
+                        id, title, status, priority, created_at, updated_at,
+                        claimed_by, lease_until, version, context_path,
+                        parent_id, tags, author, archetype
+                    ) VALUES (?, ?, 'todo', ?, ?, ?, NULL, NULL, 0, ?, ?, ?, ?, ?)
+                    """,
+                    (task_id, title, priority, now, now, context_path, parent_id, tags, author, archetype),
+                )
+            except sqlite3.IntegrityError as exc:
+                if "tasks.id" in str(exc) or getattr(exc, "sqlite_errorname", "") == "SQLITE_CONSTRAINT_PRIMARYKEY":
+                    raise sqlite3.IntegrityError(f"Task '{task_id}' already exists") from exc
+                raise
             conn.execute(
                 """
                 INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
@@ -398,6 +527,7 @@ Add task details and acceptance criteria here.
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         """Fetch a single task by ID."""
+        self._ensure_queue_ready()
         with self.get_queue_conn() as conn:
             cur = conn.cursor()
             cur.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
@@ -412,6 +542,7 @@ Add task details and acceptance criteria here.
         parent_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """List tasks matching optional filters."""
+        self._ensure_queue_ready()
         query = "SELECT * FROM tasks WHERE 1=1"
         params: List[Any] = []
         if status:
@@ -420,7 +551,7 @@ Add task details and acceptance criteria here.
         if parent_id:
             query += " AND parent_id = ?"
             params.append(parent_id)
-        query += " ORDER BY priority ASC, created_at ASC"
+        query += " ORDER BY priority ASC, created_at ASC, id ASC"
 
         with self.get_queue_conn() as conn:
             cur = conn.cursor()
@@ -441,6 +572,17 @@ Add task details and acceptance criteria here.
         3. The version in the DB matches the in-memory read version.
         """
         self._validate_task_id(task_id)
+        if not isinstance(agent, str) or not agent.strip() or not agent.replace("\r", " ").replace("\n", " ").isprintable():
+            raise ValueError("agent must be a non-empty string")
+        try:
+            if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float)) or not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+                raise ValueError(f"ttl_seconds must be a finite number > 0, got {ttl_seconds!r}")
+            now_dt = datetime.datetime.now(datetime.timezone.utc)
+            lease_until_dt = now_dt + datetime.timedelta(seconds=ttl_seconds)
+        except OverflowError as exc:
+            raise ValueError(f"ttl_seconds out of range: {ttl_seconds!r}") from exc
+        self._ensure_queue_ready()
+        self._ensure_audit_ready()
         task = self.get_task(task_id)
         if not task:
             return False
@@ -449,9 +591,7 @@ Add task details and acceptance criteria here.
         if status not in ("todo", "working"):
             return False
 
-        now_dt = datetime.datetime.now(datetime.timezone.utc)
         now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        lease_until_dt = now_dt + datetime.timedelta(seconds=ttl_seconds)
         lease_until_str = lease_until_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         current_claimant = task.get("claimed_by")
@@ -507,7 +647,7 @@ Add task details and acceptance criteria here.
             self.log_audit(
                 task_id=task_id,
                 action="task_claimed",
-                agent=agent,
+                agent=agent.replace("\r", " ").replace("\n", " "),
                 verification_status="in_progress",
                 payload=json.dumps({"lease_until": lease_until_str}),
             )
@@ -519,22 +659,71 @@ Add task details and acceptance criteria here.
         evidence_paths: Sequence[str | Path],
     ) -> List[Dict[str, Any]]:
         """Validate evidence paths against workspace boundaries and return SHA-256 metadata."""
-        allowed_root = self.rig_dir.resolve().parent
+        if isinstance(evidence_paths, (str, bytes, bytearray, Path)) or not isinstance(evidence_paths, Sequence):
+            raise ValueError("evidence_paths must be a sequence of paths, not a bare string/bytes")
+        if not evidence_paths:
+            raise ValueError("evidence_paths must not be empty")
+        rig_resolved = self.rig_dir.resolve()
+        allowed_root = self.workspace_root if self.workspace_root is not None else rig_resolved.parent
+        strict_ws_ancs = set(allowed_root.parents)
+        ws_ancs = {allowed_root, *strict_ws_ancs}
+        case_fold = os.path.normcase("A") == "a"
+        seen_paths: set[str] = set()
+        seen_files: set[Tuple[int, int]] = set()
         records: List[Dict[str, Any]] = []
         for raw_path in evidence_paths:
-            p = Path(raw_path)
-            resolved = p.resolve() if p.is_absolute() else (allowed_root / p).resolve()
-            if not resolved.is_relative_to(allowed_root):
-                raise ValueError(f"Evidence path escapes allowed root: {raw_path}")
-
-            rel = resolved.relative_to(allowed_root)
-            rel_parts_lower = [part.lower() for part in rel.parts]
-            name_lower = resolved.name.lower()
+            if not isinstance(raw_path, (str, Path)):
+                raise ValueError(f"Invalid evidence path: {raw_path!r}")
+            raw_str = str(raw_path)
+            if not raw_str.strip() or not raw_str.isprintable():
+                raise ValueError(f"Invalid evidence path: {raw_path!r}")
+            p = Path(raw_str)
+            cand = p if p.is_absolute() else (allowed_root / p)
+            abs_cand = Path(os.path.abspath(str(cand)))
+            if (
+                _is_link_or_junction(cand)
+                or _is_link_or_junction(abs_cand)
+                or any(
+                    _is_link_or_junction(a)
+                    for a in (*cand.parents, *abs_cand.parents)
+                    if a not in strict_ws_ancs
+                )
+            ):
+                raise ValueError(f"Evidence path must not be or traverse a symlink or junction: {raw_path}")
+            try:
+                resolved = cand.resolve()
+                anc_res = [a.resolve() for a in cand.parents if a not in ws_ancs]
+            except OSError as exc:
+                raise ValueError(f"Invalid evidence path: {raw_path!r}") from exc
 
             if (
-                ".stigmerig" in rel_parts_lower
-                or ".worktrees" in rel_parts_lower
-                or any(part == ".env" or part.startswith(".env.") for part in rel_parts_lower)
+                resolved == allowed_root
+                or not resolved.is_relative_to(allowed_root)
+                or any(not r.is_relative_to(allowed_root) for r in anc_res)
+            ):
+                raise ValueError(f"Evidence path escapes allowed root: {raw_path}")
+
+            if _is_link_or_junction(resolved) or any(
+                _is_link_or_junction(a) for a in resolved.parents if a not in ws_ancs
+            ):
+                raise ValueError(f"Evidence path must not be or traverse a symlink or junction: {raw_path}")
+
+            rel = resolved.relative_to(allowed_root)
+            sub_ancs = [r for r in anc_res if r != allowed_root and r.is_relative_to(allowed_root)]
+            check_parts = (
+                *(pt for c in (resolved, *sub_ancs) for pt in c.relative_to(allowed_root).parts),
+                *(() if p.is_absolute() else p.parts),
+            )
+            norm_parts = [part.rstrip(". ").lower() for part in check_parts]
+            name_lower = resolved.name.rstrip(". ").lower()
+
+            if (
+                resolved.is_relative_to(rig_resolved)
+                or any(r.is_relative_to(rig_resolved) for r in sub_ancs)
+                or ".stigmerig" in norm_parts
+                or ".git" in norm_parts
+                or ".worktrees" in norm_parts
+                or any(part == ".env" or part.startswith(".env.") for part in norm_parts)
                 or name_lower == ".env"
                 or name_lower.startswith(".env.")
                 or name_lower.startswith("queue.db")
@@ -545,9 +734,17 @@ Add task details and acceptance criteria here.
             if not resolved.exists() or not resolved.is_file():
                 raise FileNotFoundError(f"Evidence file not found: {raw_path}")
 
-            size = resolved.stat().st_size
+            st = resolved.stat()
+            size = st.st_size
             if size <= 0:
                 raise ValueError(f"Evidence file must be non-empty: {raw_path}")
+            path_key = os.path.normcase(str(resolved)).casefold() if case_fold else os.path.normcase(str(resolved))
+            file_id = (st.st_dev, st.st_ino) if (st.st_dev and st.st_ino) else None
+            if path_key in seen_paths or (file_id is not None and file_id in seen_files):
+                raise ValueError(f"Duplicate evidence path: {raw_path}")
+            seen_paths.add(path_key)
+            if file_id is not None:
+                seen_files.add(file_id)
 
             digest = hashlib.sha256()
             with resolved.open("rb") as fh:
@@ -575,6 +772,20 @@ Add task details and acceptance criteria here.
     ) -> Tuple[bool, str]:
         """Mark task as done enforcing anti-self-approval when required."""
         self._validate_task_id(task_id)
+        if not isinstance(allow_self_approval, bool):
+            raise ValueError("allow_self_approval must be a bool")
+        if not isinstance(agent, str) or not agent.strip() or not agent.replace("\r", " ").replace("\n", " ").isprintable():
+            raise ValueError("agent must be a non-empty printable string")
+        if verifier is not None:
+            if not isinstance(verifier, str):
+                raise ValueError("verifier must be a string")
+            verifier = verifier.strip() or None
+            if verifier is not None and not verifier.isprintable():
+                raise ValueError("verifier must be printable")
+        if session_id is not None and (not isinstance(session_id, str) or not session_id.strip() or not session_id.isprintable()):
+            raise ValueError("session_id must be a non-empty printable string")
+        self._ensure_queue_ready()
+        self._ensure_audit_ready()
         task = self.get_task(task_id)
         if not task:
             return False, f"Task {task_id} not found"
@@ -608,16 +819,15 @@ Add task details and acceptance criteria here.
 
         # Anti-self-approval rule
         if not allow_self_approval:
-            if verifier is None or not str(verifier).strip():
+            if verifier is None:
                 raise PermissionError("Independent --verifier is required unless --allow-self-approval is set.")
-            clean_verifier = str(verifier).strip()
-            if _is_self_approval(agent, clean_verifier) or _is_self_approval(task.get("claimed_by"), clean_verifier):
+            if _is_self_approval(agent, verifier) or _is_self_approval(task.get("claimed_by"), verifier):
                 raise PermissionError(
                     f"Self-approval forbidden: verifier '{verifier}' matches agent '{agent}' or claimant '{task.get('claimed_by')}'."
                 )
 
         evidence_records: List[Dict[str, Any]] = []
-        if evidence_paths:
+        if evidence_paths is not None:
             evidence_records = self._validate_and_hash_evidence(evidence_paths)
 
         seat = derive_seat(agent)
@@ -668,7 +878,7 @@ Add task details and acceptance criteria here.
         self.log_audit(
             task_id=task_id,
             action="task_completed",
-            agent=agent,
+            agent=agent.replace("\r", " ").replace("\n", " "),
             verification_status="verified" if verifier else "unverified",
             payload=json.dumps(event_payload),
         )
@@ -677,6 +887,7 @@ Add task details and acceptance criteria here.
 
     def get_next_workflow_step(self, task_id: str) -> Dict[str, Any]:
         """Compute next workflow step under parent task or epic enforcing workflow rails."""
+        self._ensure_queue_ready()
         task = self.get_task(task_id)
         if not task:
             return {}
@@ -709,12 +920,12 @@ Add task details and acceptance criteria here.
         for target_arch in preferred:
             matching = [s for s in todo_siblings if s.get("archetype") == target_arch]
             if matching:
-                matching.sort(key=lambda s: (int(s.get("priority") if s.get("priority") is not None else 100), s.get("created_at", "")))
+                matching.sort(key=lambda s: (int(s.get("priority") if s.get("priority") is not None else 100), s.get("created_at") or "", s.get("id") or ""))
                 selected = matching[0]
                 break
 
         if not selected:
-            todo_siblings.sort(key=lambda s: (int(s.get("priority") if s.get("priority") is not None else 100), s.get("created_at", "")))
+            todo_siblings.sort(key=lambda s: (int(s.get("priority") if s.get("priority") is not None else 100), s.get("created_at") or "", s.get("id") or ""))
             selected = todo_siblings[0]
 
         return {
@@ -728,6 +939,16 @@ Add task details and acceptance criteria here.
     def fail_task(self, task_id: str, agent: str, reason: str) -> bool:
         """Mark task as blocked or failed."""
         self._validate_task_id(task_id)
+        header_err = _validate_audit_header_fields(task_id, "task_blocked", agent, "failed")
+        if (
+            header_err is not None
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or not reason.replace("\t", " ").replace("\n", " ").replace("\r", " ").isprintable()
+        ):
+            raise ValueError(header_err or "reason must be a non-empty printable string without control characters")
+        self._ensure_queue_ready()
+        self._ensure_audit_ready()
         task = self.get_task(task_id)
         if not task:
             raise KeyError(f"Task '{task_id}' not found.")
@@ -739,15 +960,18 @@ Add task details and acceptance criteria here.
         if task["status"] in ("done", "cancelled", "canceled", "archived"):
             raise PermissionError(f"Cannot fail task '{task_id}' in terminal status '{task['status']}'.")
 
-        # Block stale-claimant split-brain overwrites (F-02)
+        # Block stale-claimant and NULL-lease non-owner split-brain overwrites (F-02)
+        claimed_by = task.get("claimed_by")
+        lease_until = task.get("lease_until")
         if (
             task["status"] == "working"
-            and task.get("claimed_by") != agent
-            and task.get("lease_until")
-            and task.get("lease_until") >= now
+            and claimed_by is not None
+            and str(claimed_by).strip() != ""
+            and claimed_by != agent
+            and (lease_until is None or not str(lease_until).strip() or lease_until >= now)
         ):
             raise PermissionError(
-                f"Task '{task_id}' is actively leased by '{task.get('claimed_by')}'; '{agent}' cannot fail it."
+                f"Task '{task_id}' is actively leased by '{claimed_by}'; '{agent}' cannot fail it."
             )
 
         with self.get_queue_conn() as conn:
@@ -777,8 +1001,16 @@ Add task details and acceptance criteria here.
                         updated_at = ?
                     WHERE id = ?
                       AND version = ?
+                      AND status NOT IN ('done', 'cancelled', 'canceled', 'archived')
+                      AND NOT (
+                          status = 'working'
+                          AND claimed_by IS NOT NULL
+                          AND TRIM(claimed_by) != ''
+                          AND claimed_by != ?
+                          AND (lease_until IS NULL OR TRIM(lease_until) = '' OR lease_until >= ?)
+                      )
                     """,
-                    (now, task_id, expected_version),
+                    (now, task_id, expected_version, agent, now),
                 )
 
             if cur.rowcount != 1:
@@ -805,8 +1037,8 @@ Add task details and acceptance criteria here.
         self.sync_board()
         try:
             self._record_blocker_trap(task_id=task_id, agent=agent, reason=reason)
-        except Exception:
-            pass
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Failed to persist trap for %s: %s", task_id, exc)
         return True
 
     def _record_blocker_trap(
@@ -816,6 +1048,10 @@ Add task details and acceptance criteria here.
         reason: str,
     ) -> Optional[Dict[str, Any]]:
         """Persist deduplicated blocker trap candidates into traps.json (failure-soft)."""
+        with self._lock:
+            return self._record_blocker_trap_unlocked(task_id=task_id, agent=agent, reason=reason)
+
+    def _record_blocker_trap_unlocked(self, task_id: str, agent: str, reason: str) -> Optional[Dict[str, Any]]:
         clean_reason = (reason or "").strip() or "unspecified blocker"
         trigger_pattern = _normalize_blocker_signature(clean_reason)
         traps_path = self.rig_dir / "traps.json"
@@ -829,7 +1065,7 @@ Add task details and acceptance criteria here.
                 if isinstance(loaded, dict) and isinstance(loaded.get("traps"), list):
                     doc = loaded
                     doc.setdefault("version", "1.0.0")
-            except Exception:
+            except (OSError, ValueError):
                 doc = {"version": "1.0.0", "traps": []}
 
         traps: List[Dict[str, Any]] = doc["traps"]
@@ -852,10 +1088,11 @@ Add task details and acceptance criteria here.
                 break
 
         if matched is not None:
-            occurrences = int(matched.get("occurrences", 0)) + 1
+            raw_occ, raw_traces = matched.get("occurrences"), matched.get("source_traces")
+            occurrences = (int(raw_occ) if not isinstance(raw_occ, bool) and (isinstance(raw_occ, int) or (isinstance(raw_occ, float) and math.isfinite(raw_occ))) and raw_occ >= 0 else 0) + 1
             matched["occurrences"] = occurrences
             matched["last_seen_at"] = now
-            traces = [str(x) for x in (matched.get("source_traces") or [])]
+            traces = [str(x) for x in raw_traces] if isinstance(raw_traces, list) else []
             traces.append(trace_entry)
             matched["source_traces"] = traces[-10:]
             matched["promotion_candidate"] = occurrences >= 3
@@ -882,7 +1119,7 @@ Add task details and acceptance criteria here.
             }
             traps.append(result)
 
-        traps_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        _atomic_write_text(traps_path, json.dumps(doc, indent=2) + "\n")
         return result
 
     def log_audit(
@@ -894,8 +1131,18 @@ Add task details and acceptance criteria here.
         payload: str = "",
     ) -> str:
         """Append an entry to the SHA-256 hash-chained WORM audit ledger."""
-        now = utc_now_iso()
+        self._validate_task_id(task_id)
+        header_err = _validate_audit_header_fields(task_id, action, agent, verification_status)
+        if header_err is not None or not isinstance(payload, str):
+            raise ValueError(header_err or "payload must be a string")
         payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        with self._lock:
+            if not self.audit_db_path.is_file():
+                raise FileNotFoundError(f"Uninitialized audit database: {self.audit_db_path}")
+            return self._log_audit_unlocked(task_id, action, agent, verification_status, payload_hash)
+
+    def _log_audit_unlocked(self, task_id: str, action: str, agent: str, verification_status: str, payload_hash: str) -> str:
+        now = utc_now_iso()
 
         conn = sqlite3.connect(str(self.audit_db_path), timeout=10.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
@@ -905,6 +1152,8 @@ Add task details and acceptance criteria here.
             conn.execute("PRAGMA busy_timeout = 5000;")
             conn.execute("BEGIN IMMEDIATE;")
             cur = conn.cursor()
+            if not (tbl := cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_log'").fetchone()) or "VIRTUAL TABLE" in (tbl["sql"] or "").upper():
+                raise sqlite3.OperationalError("audit_log table does not exist")
             cur.execute("SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1")
             row = cur.fetchone()
             previous_hash = row["entry_hash"] if row else GENESIS_HASH
@@ -935,48 +1184,78 @@ Add task details and acceptance criteria here.
         except Exception:
             try:
                 conn.execute("ROLLBACK;")
-            except Exception:
-                pass
+            except sqlite3.Error as rb_exc:
+                logging.getLogger(__name__).debug("Audit rollback failed: %s", rb_exc)
             raise
         finally:
             conn.close()
 
     def verify_audit_chain(self) -> Tuple[bool, str]:
         """Validate hash chain link integrity across all entries in audit_log supporting Tier A and Tier B."""
-        with self.get_audit_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("PRAGMA table_info(audit_log)")
-            cols = {r["name"] for r in cur.fetchall()}
-            if not cols:
-                return True, "audit_log table does not exist"
-            hash_col = "hash" if "hash" in cols else "entry_hash"
+        if not self.audit_db_path.is_file():
+            return False, "audit.db does not exist"
+        tier_b_cols = ("timestamp", "task_id", "action", "agent", "verification_status", "payload_hash", "previous_hash")
+        try:
+            with self.get_audit_conn() as conn:
+                cur = conn.cursor()
+                master = cur.execute("SELECT type, sql FROM sqlite_master WHERE name='audit_log'").fetchone()
+                if not master or master["type"] != "table" or "VIRTUAL TABLE" in (master["sql"] or "").upper():
+                    return False, "audit_log table does not exist" if not master else "audit_log must be a base table"
+                cols = {r["name"] for r in cur.execute("PRAGMA table_info(audit_log)").fetchall()}
+                cols_lower = {c.lower() for c in cols}
+                hash_col = "entry_hash" if "entry_hash" in cols else "hash"
+                is_tier_b = bool(cols_lower & TIER_B_AUDIT_MARKERS)
+                required = {"id", hash_col, *(tier_b_cols if is_tier_b else ("previous_hash",))}
+                if (is_tier_b and hash_col != "entry_hash") or not required.issubset(cols):
+                    return False, "audit_log schema invalid"
 
-            cur.execute("SELECT * FROM audit_log ORDER BY id ASC")
-            rows = [dict(r) for r in cur.fetchall()]
+                cur.execute("SELECT * FROM audit_log ORDER BY id ASC")
+                rows = [dict(r) for r in cur.fetchall()]
+                seq_vals = [r["seq"] for r in cur.execute("SELECT seq FROM sqlite_sequence WHERE name='audit_log'").fetchall()] if cur.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+                ).fetchone() else []
+        except sqlite3.DatabaseError as exc:
+            return False, f"audit.db database error: {exc}"
 
+        if len(seq_vals) > 1 or ("AUTOINCREMENT" in (master["sql"] or "").upper() and rows and not seq_vals):
+            return False, "Audit sequence metadata corrupted"
+        if seq_vals and (isinstance(seq_vals[0], bool) or not isinstance(seq_vals[0], int) or seq_vals[0] < 1 or seq_vals[0] != len(rows)):
+            return False, f"Invalid or tampered audit sequence: seq={seq_vals[0]!r}, rows={len(rows)}"
         if not rows:
             return True, "Audit log is empty"
 
+        allowed_genesis = (GENESIS_HASH,) if is_tier_b else (GENESIS_HASH, None, "")
         prev_hash: Optional[str] = None
         for i, row in enumerate(rows):
+            if isinstance(row.get("id"), bool) or not isinstance(row.get("id"), int) or row.get("id") != i + 1:
+                return False, f"Non-contiguous audit ID: expected {i + 1}, got {row.get('id')!r}"
             current_hash = row.get(hash_col)
             previous_hash = row.get("previous_hash")
 
+            if is_tier_b and not all(isinstance(row.get(c), str) for c in tier_b_cols):
+                return False, f"Invalid Tier B header column type at ID {row['id']}"
+
             if i == 0:
-                # Genesis row: previous_hash can be "0"*64, None, or empty
-                if previous_hash not in ("0" * 64, None, ""):
+                if previous_hash not in allowed_genesis:
                     return (
                         False,
                         f"Hash break at genesis ID {row['id']}: expected genesis, got {previous_hash}",
                     )
             else:
+                if not isinstance(previous_hash, str) or not SHA256_HEX_PATTERN.fullmatch(previous_hash):
+                    return False, f"Invalid previous_hash format at ID {row['id']}"
                 if previous_hash != prev_hash:
                     return (
                         False,
                         f"Hash break at ID {row['id']}: expected previous {prev_hash}, got {previous_hash}",
                     )
 
-            if hash_col == "entry_hash" and "payload_hash" in cols:
+            if is_tier_b:
+                if not _is_canonical_utc_iso(row["timestamp"]):
+                    return False, f"Invalid Tier B timestamp at ID {row['id']}"
+                header_err = _validate_audit_header_fields(row["task_id"], row["action"], row["agent"], row["verification_status"])
+                if header_err is not None:
+                    return False, f"Invalid Tier B header at ID {row['id']}: {header_err}"
                 raw_header = (
                     f"{row['timestamp']}:{row['task_id']}:{row['action']}:"
                     f"{row['agent']}:{row['verification_status']}:{row['payload_hash']}:{row['previous_hash']}"
@@ -987,6 +1266,11 @@ Add task details and acceptance criteria here.
                         False,
                         f"Hash mismatch at ID {row['id']}: calculated {calculated_hash}, stored {current_hash}",
                     )
+                if not isinstance(row.get("payload_hash"), str) or not SHA256_HEX_PATTERN.fullmatch(row["payload_hash"]):
+                    return False, f"Invalid payload_hash format at ID {row['id']}"
+
+            if not isinstance(current_hash, str) or not SHA256_HEX_PATTERN.fullmatch(current_hash):
+                return False, f"Invalid hash format at ID {row['id']}"
 
             prev_hash = current_hash
 
@@ -994,6 +1278,11 @@ Add task details and acceptance criteria here.
 
     def sync_board(self) -> Path:
         """Render markdown board partitioned by status into Task_Board.md."""
+        with self._lock:
+            return self._sync_board_unlocked()
+
+    def _sync_board_unlocked(self) -> Path:
+        self._ensure_queue_ready()
         tasks = self.list_tasks()
         sections: Dict[str, List[Dict[str, Any]]] = {
             "todo": [],
@@ -1003,7 +1292,7 @@ Add task details and acceptance criteria here.
         }
 
         for t in tasks:
-            st = t["status"]
+            st = "cancelled" if t["status"] in ("cancelled", "canceled", "archived") else t["status"]
             if st not in sections:
                 sections[st] = []
             sections[st].append(t)
@@ -1022,6 +1311,8 @@ Add task details and acceptance criteria here.
             ("blocked", "Blocked / Human Hold"),
             ("done", "Completed"),
         ]
+        if sections.get("cancelled"):
+            status_display.append(("cancelled", "Cancelled / Archived"))
 
         for st_key, display_name in status_display:
             items = sections.get(st_key, [])
@@ -1041,5 +1332,5 @@ Add task details and acceptance criteria here.
                     content.append(f"| `{clean_id}` | {clean_title} | `{arch}` | {claimant} | {clean_updated} |")
             content.append("")
 
-        self.board_path.write_text("\n".join(content) + "\n", encoding="utf-8")
+        _atomic_write_text(self.board_path, "\n".join(content) + "\n")
         return self.board_path
