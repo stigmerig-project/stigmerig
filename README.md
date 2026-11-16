@@ -7,13 +7,20 @@
 StigmeRig is a sovereign, local-first multi-agent coordination engine.
 It coordinates autonomous coding agents through environmental stigmergy without centralized cloud brokers.
 
-![StigmeRig — Multi-Agent Coordination and Orchestration Engine](assets/stigmerig-social-preview.png)
+![StigmeRig: Multi-Agent Coordination and Orchestration Engine](assets/stigmerig-social-preview.png)
 
 ## Intellectual Lineage and Provenance
 
 StigmeRig synthesizes foundational concepts across biology, distributed systems, and agent architecture:
 
 - **Pierre-Paul Grasse (1959)**: Formulated biological stigmergy, showing how decentralized social insects coordinate indirectly through environmental modifications.
+- **Gene M. Amdahl (1967) & Eliyahu Goldratt (*The Goal*)**: Sequential bottlenecks and coupled constraints cap system throughput when only local stages speed up.
+- **Fred Brooks (1975, *The Mythical Man-Month*)**: Communication overhead and integration drag scale non-linearly with added workers.
+- **Chen & Stratton (Harvard, 2026)**: AI developer tools increased pull-request volume by 23 percent while merge times grew 49 percent.
+- **METR (2025/2026)**: Developers in mature repositories worked 19 percent slower with AI despite believing they worked faster.
+- **Rotenstein et al. (*JAMA*, 2025) & Murray (*JAMIA Open*, 2025)**: Clinical AI scribes reduced aggregate charting time while retaining human auditing and tone-editing overhead.
+- **Amazon 90-Day Code Safety Reset (2026)**: Mandated senior sign-offs and pre-deploy docs on high-risk GenAI changes, motivating Intentional Friction gates.
+- **Lauren Tan (SpaceXSI)**: Scalable multi-agent review requires verification receipts and deterministic ratchets rather than diff inspection.
 - **Nate B Jones**: Pioneered sovereign local-first AI architectures, deterministic agent rails, and strict execution-verification separation.
 - **Jake Van Clief (`Interpretable Context Model - ICM`)**: Formulated file-over-app execution boundaries, tiered context pruning, and automated orientation scaffolding (`AGENTS.md` and `CONTEXT.md`).
 - **Mike (`@FeralMachine`) (`OpenRig`)**: Architected multi-agent civilization topologies, persistent rigs, and progressive disclosure context engineering.
@@ -21,18 +28,19 @@ StigmeRig synthesizes foundational concepts across biology, distributed systems,
 
 ## Control Plane Architecture
 
-StigmeRig structures autonomous work across a four-stage deterministic pipeline backed by SQLite WAL state and git worktrees.
+StigmeRig structures autonomous work across a five-stage deterministic pipeline backed by SQLite WAL state and git worktrees.
 
 ![StigmeRig Control Plane Architecture](assets/stigmerig-architecture.png)
 
-1. **ICM and Atomic Queue (`.stigmerig/queue.db`)**: Scaffolds repository orientation files and coordinates priority claims via Compare-And-Swap (`version`) leases.
+1. **ICM and Atomic Queue (`.stigmerig/queue.db`)**: Scaffolds orientation files and coordinates claims with Compare-And-Swap leases and review-queue backpressure.
 2. **Worktree Waves (`stigmerig.wave`)**: Bounds concurrent execution to 3 to 5 tasks inside isolated `.worktrees/<ID>` git branches.
-3. **Separation of Duties (`Verifier Gate`)**: Blocks missing verifiers and aliased self-approvals while routing handoffs across workflow rails.
-4. **WORM Audit and Telemetry (`audit.db` and `traps.json`)**: Enforces trigger-protected SHA-256 hash chains, Anti-DMV governance ratios, and blocker deduplication.
+3. **Asynchronous Review State (`task review`)**: Transitions completed work to review status, clears leases, and records SHA-256 evidence.
+4. **Separation of Duties (`task approve`)**: Blocks self-approvals, enforces Intentional Friction policies, and records independent verifier signatures.
+5. **WORM Audit and Telemetry (`audit.db` and `traps.json`)**: Enforces trigger-protected SHA-256 hash chains, bottleneck metrics, and deduplicated blocker traps.
 
 ## Swarm Failure Modes and Architectural Defenses
 
-Multi-agent swarms fail predictably when unconstrained. StigmeRig provides deterministic defenses against nine failure modes:
+Multi-agent swarms fail predictably when unconstrained. StigmeRig provides deterministic defenses against twelve failure modes:
 
 | Swarm Failure Mode | Pathological Behavior | StigmeRig Architectural Defense |
 | :--- | :--- | :--- |
@@ -42,44 +50,110 @@ Multi-agent swarms fail predictably when unconstrained. StigmeRig provides deter
 | **Context Window Blowout** | Agents pass unbounded conversational history, exhausting token budgets. | Environmental stigmergy coordinates through compact SQLite state transitions and scoped task files. |
 | **Recursive Swarm Traps** | Agents cycle endlessly on edge cases or expand task scope. | Workflow rails guide archetype transitions (`diff_synthesizer` to `unit_tester` to `policy_gatekeeper`). |
 | **Verification Bureaucracy ("DMV Trap")** | Review ceremony outnumbers implementation work and stalls delivery. | Tracks `verify_only_ratio <= 0.30`, `dmv_alert`, and `ceremony_ratio` across leaf archetypes. |
+| **Downstream Review Flood** | High-velocity agents generate excessive pull requests that overwhelm reviewer capacity and stall releases. | Atomic review-queue backpressure (`max_pending_review`) in `rig.json` throttles new claims until reviews complete. |
+| **Unverified Critical-Path Self-Approval** | Autonomous agents bypass oversight or self-approve high-risk security, infrastructure, or release tasks. | Intentional Friction gates (`high_friction_tags`, `high_friction_globs`) forbid self-approval and mandate SHA-256 evidence. |
+| **Brownfield Trap Overload** | Enabling strict static traps on mature legacy repositories produces overwhelming scan noise and blocks adoption. | Baseline ratchets (`--baseline` and `--write-baseline`) snapshot legacy violations and fail only on net-new infractions. |
 | **Amnesiac Repeat Failures** | Agents hit identical blockers repeatedly without retaining institutional memory. | Deduplicates normalized failure signatures in `.stigmerig/traps.json`, flagging `promotion_candidate` at `occurrences >= 3`. |
-| **Parallel Branch Collisions** | Concurrent workers corrupt shared working trees or leave half-merged conflicts. | `WorktreeManager` and `WaveRunner` enforce 3–5 wave caps, clean-tree checks, and `git merge --abort` rollback. |
+| **Parallel Branch Collisions** | Concurrent workers corrupt shared working trees or leave half-merged conflicts. | `WorktreeManager` and `WaveRunner` enforce 3 to 5 wave caps, clean-tree checks, and `git merge --abort` rollback. |
 | **Parent-Board Clobbering** | Subproject swarms overwrite root workspace queues, boards, or trap registries. | `--rig-dir` and `STIGMERIG_ROOT` isolate local `queue.db`, `<rig_dir>/Task_Board.md`, and `<rig_dir>/traps.json`. |
 
-## Standards Alignment: NIST AI RMF and SSDF
+## Standards Alignment and Defense-in-Depth Boundaries
 
-StigmeRig implements controls aligned with federal and international software assurance frameworks:
+StigmeRig aligns coordination controls with federal software assurance frameworks across distinct operational planes.
 
-- **NIST AI RMF 1.0 (Artificial Intelligence Risk Management Framework)**:
-  - `GOVERN 1.2 / 1.3`: Separates roles and enforces organizational boundaries between builders and verifiers.
-  - `MEASURE 2.6 / 2.7`: Enforces independent verification and immutable execution telemetry.
-  - `MANAGE 2.4`: Limits blast radiuses through git worktree sandboxes and short-lived leases.
-- **NIST SP 800-218 (Secure Software Development Framework - SSDF)**:
-  - `PO.3.2`: Prevents unauthorized software changes via authenticated task claims.
-  - `PS.1.1`: Mandates separation of duties across implementation and verification agents.
-  - `PW.1.2`: Records tamper-evident audit trails for all code state transitions.
-- **NIST SP 800-53 Rev. 5 (Security and Privacy Controls)**:
-  - `AC-3 / AC-4`: Access and information flow enforcement through atomic database leases.
-  - `AU-2 / AU-3 / AU-9`: Protection of audit information via append-only cryptographic hash chains.
-  - `AU-10`: Non-repudiation of agent claims and verification receipts.
+- **NIST AI RMF 1.0**:
+  - `GOVERN 1.2 / 1.3`: Separates builder and verifier roles across independent execution turns.
+  - `MEASURE 2.6 / 2.7`: Enforces independent verification and immutable WORM execution telemetry.
+  - `MANAGE 2.4`: Limits blast radiuses through git worktree isolation and bounded leases.
+- **NIST SP 800-218 and SP 800-218A (SSDF)**:
+  - `PO.3.2`: Gates software mutations behind atomic Compare-And-Swap task claims.
+  - `PS.1.1 / PS.3.2`: Separates builder and verifier duties while recording optional `STIGMERIG_MODEL` attribution.
+  - `PW.1.2 / PW.4`: Records tamper-evident audit trails and pins CI actions via `TRAP-021`.
+- **NIST SP 800-53 Rev. 5**:
+  - `AC-3 / AC-4`: Coordinates task access and state flow through atomic database leases.
+  - `AU-2 / AU-3 / AU-9`: Protects local audit records with SHA-256 WORM hash chains.
+  - `AU-10`: Requires asymmetric non-repudiation from external Plane 3 gateways rather than local SQLite.
 
-## Security and Concurrency Invariants (v0.1.4)
+```mermaid
+flowchart TD
+    subgraph Ext["Out-of-Process Infrastructure Planes (External Tooling Required)"]
+        P1["Plane 1: Kernel, Filesystem, and Network Sandbox (Docker, Podman, gVisor, Firecracker, Egress Proxy)"]
+        P2["Plane 2: Non-Human Identity and Ephemeral Secrets (Vault, Secrets Manager, SOPS, SPIFFE, OIDC)"]
+        P3["Plane 3: Wire RBAC, MCP Packet Firewall, and Model Gateway (OPA, Cedar, Envoy AI Gateway, LLM Guard, Sigstore, LiteLLM)"]
+    end
+    subgraph Nat["In-Repository Coordination Plane (Solved Natively in StigmeRig)"]
+        P4["Plane 4: CAS Leases, Review Backpressure, Intentional Friction, Passive Model Lineage, WORM SHA-256, and Trap Ratchets"]
+    end
+    P1 --> P2 --> P3 --> P4
+```
 
-StigmeRig enforces four operational security and concurrency invariants across all execution workflows:
+### External Security Tool Categories, Threats, and Tradeoffs
 
-- **Lease-Bound Compare-And-Swap (`CAS`) Transitions**: `complete_task` and `fail_task` verify active `working` lease ownership, unexpired `lease_until` timestamps, and `version` compare-and-swap checks. Parent epics also verify open child-task completion before closing.
-- **Resolved Path Containment**: Task identifiers must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`. Task files and `.worktrees/<TASK_ID>` directories enforce resolved `Path.is_relative_to()` containment.
-- **Forensic Worktree Retention**: When a `WaveRunner` task action or commit raises an exception, StigmeRig marks the task `blocked`. The runner retains the isolated worktree on disk for inspection instead of deleting uncommitted changes.
-- **Cooperative Trust Boundary**: CLI flags such as `--agent` and `--verifier` enforce workflow separation across cooperative local agents. They do not provide cryptographic authentication against untrusted operating system adversaries.
+Effective agent security splits kernel isolation, secret injection, wire gateways, and repository coordination into four planes.
+
+- **Plane 1 (Kernel, Filesystem, and Network Sandbox)**:
+  - **Examples**: Rootless Docker or Podman containers, gVisor, Firecracker MicroVMs, and egress proxies such as Envoy, Squid, or `iptables`.
+  - **Threats Mitigated**: Blocks arbitrary host shell escapes, symlink escapes outside worktrees, and silent outbound data exfiltration.
+  - **Implementation Tradeoffs**: Adds container image maintenance, bind-mount permission friction, and MicroVM cold-boot memory overhead.
+- **Plane 2 (Non-Human Identity and Ephemeral Secrets)**:
+  - **Examples**: Secret vaults and workload identity brokers such as HashiCorp Vault, AWS Secrets Manager, SOPS, SPIFFE, or OIDC.
+  - **Threats Mitigated**: Prevents plaintext `.env` credential leaks, shared static keys, and cross-host agent identity spoofing.
+  - **Implementation Tradeoffs**: Requires external vault availability, short TTL token renewal plumbing, and offline bootstrap fallbacks.
+- **Plane 3 (Wire RBAC, MCP Packet Firewall, and Model Gateway)**:
+  - **Examples**: Policy engines such as OPA or Cedar, Envoy AI Gateway, LLM Guard, Sigstore receipts, and LiteLLM routers.
+  - **Threats Mitigated**: Stops unauthorized tool mutations, secret exfiltration across MCP streams, and missing `AU-10` asymmetric non-repudiation.
+  - **Implementation Tradeoffs**: Introduces proxy latency, persistent gateway database operations, and DLP regex tuning for tool schemas.
+- **Plane 4 (In-Repository Coordination Solved Natively in StigmeRig)**:
+  - **Examples**: CAS task leases, `task review` and `task approve` gates, `max_pending_review` backpressure, Intentional Friction, `STIGMERIG_MODEL`, WORM SHA-256, and `stigmerig traps`.
+  - **Threats Mitigated**: Prevents split-brain overwrites, self-approval collusion, and downstream review floods. Blocks unpinned CI actions (`TRAP-021`) and local tampering (`AU-9`).
+  - **Implementation Tradeoffs**: Treats CLI `--agent` and `--verifier` flags as cooperative workflow rails rather than adversarial kernel boundaries.
+
+### Design Boundaries: Controls Intentionally Excluded to Protect Velocity
+
+StigmeRig excludes five high-ceremony controls that degrade refactoring quality and engineering velocity without adding real security:
+
+- **Per-Task File Allowlists (`--allowed-globs`)**:
+  - Software engineering discovers root causes across module boundaries.
+  - Pre-locking file allowlists triggers Premature Specification and forces symptom patches instead of clean fixes.
+  - Global `high_friction_globs` already guards sensitive infrastructure paths during `WaveRunner` merges.
+- **Local Symmetric HMAC Audit Chains**:
+  - Local symmetric key provisioning adds rotation overhead without delivering asymmetric `AU-10` non-repudiation.
+  - SQLite WORM triggers and SHA-256 hash chains detect accidental tampering at zero operational cost.
+  - Plane 3 external gateways issue Ed25519 or Sigstore flight receipts when cryptographic non-repudiation matters.
+- **Per-Task Dependency Lockfile Re-Hashing**:
+  - Re-hashing multi-megabyte lockfiles on every task state change adds I/O latency and bloats `queue.db`.
+  - Git content-addressed Merkle trees already record exact lockfile revisions on every task branch.
+- **Blast-Radius CLI Forensics (`audit trace`)**:
+  - Maintaining a dedicated trace subcommand adds code surface before multi-model histories accumulate.
+  - Optional `model_id` attributes already bind into `task_events` payloads for direct SQLite JSON queries.
+- **Noisy Broad Starter Regex Packs**:
+  - Prefix-matching secret and shell-pipe regex packs flag documentation examples and create alert fatigue.
+  - Dedicated offline entropy scanners run with lower noise, while `TRAP-021` cleanly pins mutable workflow actions.
+
+## Security and Concurrency Invariants (v0.1.5)
+
+StigmeRig enforces operational security and concurrency invariants across all workflows:
+
+- **Lease-Bound Compare-And-Swap (`CAS`) Transitions**: Status changes verify active lease ownership, unexpired timestamps, and atomic version checks. Parent epics also verify child task completion before closing.
+- **Review and Approval Separation**: `task review` transitions tasks to `review`, clears the lease, and binds SHA-256 evidence. `task approve` transitions `review` to `done` and enforces distinct verifiers.
+- **Atomic Review-Queue Backpressure**: SQLite subqueries throttle new claims when pending reviews reach `max_pending_review` in `rig.json`.
+- **Intentional Friction on Critical Paths**: Tasks matching `high_friction_tags` or `high_friction_globs` forbid self-approval and require independent verification evidence.
+- **Resolved Path Containment**: Task identifiers must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`. Task files and `.worktrees/<TASK_ID>` directories enforce resolved path containment.
+- **Forensic Worktree Retention**: When an action raises an exception, StigmeRig marks the task `blocked`. The runner retains the isolated worktree on disk for inspection.
+- **Cooperative Trust Boundary**: CLI flags such as `--agent` and `--verifier` enforce workflow separation across cooperative local agents.
 
 ## Core Features
 
 - **Local-First SQLite WAL State**: Coordinates concurrent readers and writers in `.stigmerig/queue.db` with zero network brokers.
 - **WORM Cryptographic Audit Ledger**: Protects `.stigmerig/audit.db` with SHA-256 hash chaining and SQLite `BEFORE UPDATE` and `BEFORE DELETE` triggers.
+- **Review-Queue Backpressure**: Atomic SQLite subqueries throttle builder claims when unreviewed tasks reach `max_pending_review`.
+- **Intentional Friction Gates**: Blocks self-approval and mandates cryptographic evidence for sensitive tags and paths.
 - **ICM Startup Scaffolding**: Generates `AGENTS.md`, `CONTEXT.md`, and `.stigmerig/rig.json` on initialization, writing `.stigmerig/AGENTS.stigmerig.md` when `AGENTS.md` exists.
 - **Composite Anti-Self-Approval Gate**: Blocks direct and aliased self-verification across `seat/agent`, `agent@host`, and `role:agent` identifiers.
 - **Rolling Git Worktree Waves**: Executes 3 to 5 tasks per batch in `.worktrees/<ID>` with archetype commit attribution and `--no-ff` merges.
-- **Anti-DMV and Wave Topology Telemetry**: Computes `verify_only_ratio`, `ceremony_ratio`, epic `phase_depth`, `max_wave_width`, and Mermaid handoff diagrams.
+- **Anti-DMV and Wave Topology Telemetry**: Computes `verify_only_ratio`, `ceremony_ratio`, `review_wait_ratio`, epic `phase_depth`, and Mermaid handoff diagrams.
+- **Brownfield Baseline Ratchets**: Suppresses legacy violations using multiset fingerprints while catching net-new regressions.
+- **Verification Trap Pack**: Catches skipped tests, blanket linter suppressions, and unverified documentation stubs.
 - **Normalized Blocker Trap Harvesting**: Deduplicates recurring failure signatures in `.stigmerig/traps.json` and promotes persistent traps at three occurrences.
 - **Tier A and Tier B Schema Interoperability**: Reads flat or nested task files, normalizes event schemas, and isolates `--rig-dir` sandboxes.
 - **Zero Runtime Cloud Dependencies**: Built purely on the Python 3.10+ standard library (`sqlite3`, `argparse`, `hashlib`, `subprocess`).
@@ -110,7 +184,7 @@ Verify your installation:
 stigmerig --help
 ```
 
-## Quick Start: The Four-Step Coordination Cycle
+## Quick Start: The Coordination Cycle
 
 ### 1. Initialize Your Repository
 
@@ -140,9 +214,32 @@ Agents claim tasks using atomic Compare-And-Swap (CAS) leases. Leases expire aft
 stigmerig task claim --id TASK-001 --agent AgentAlpha --ttl 1800
 ```
 
-### 4. Complete Tasks with Independent Verification
+### 4. Submit Tasks for Asynchronous Review
 
-StigmeRig enforces separation of duties. The implementation agent cannot approve its own work:
+Agents submit completed work for review with cryptographic verification evidence:
+
+```bash
+stigmerig task review --id TASK-001 --agent AgentAlpha --summary "Implemented auth feature" --evidence auth.py
+```
+
+This transitions the task to `review`, clears the lease, and records SHA-256 evidence.
+
+### 5. Approve Reviews and Verify Hash Chains
+
+An independent verifier validates artifacts and closes the task:
+
+```bash
+stigmerig task approve --id TASK-001 --verifier AgentBeta --evidence auth.py
+```
+
+StigmeRig rejects approvals from agents that implemented the task.
+If verification fails, a reviewer rejects the submission back to `blocked` for rework:
+
+```bash
+stigmerig task fail --id TASK-001 --agent AgentBeta --reason "Missing negative boundary test"
+```
+
+Direct completion remains supported for low-friction tasks:
 
 ```bash
 stigmerig task done --id TASK-001 --agent AgentAlpha --verifier AgentBeta --session-id "session-001"
@@ -222,6 +319,10 @@ StigmeRig audits leaf tasks against four verify-only archetypes (`unit_tester`, 
 - **`ceremony_ratio`**: Combines verify-only tasks and `self_execution_override` events divided by total leaf tasks.
 - **`rework_tasks`**: Counts tasks with distinct claimants, blocked transitions, or force-claimed leases under the Normative Rework Definition.
 - **`rework_rate`**: Divides `rework_tasks` by total tasks in `stigmerig telemetry metrics --json`.
+- **`pending_review_tasks`**: Counts tasks currently awaiting asynchronous verification.
+- **`review_wait_ratio`**: Measures time spent waiting in review compared to active implementation time.
+- **`review_bottleneck_alert`**: Triggers `true` when the review wait ratio exceeds healthy thresholds.
+- **`unverified_completion_rate`**: Audits tasks closed without explicit SHA-256 verification evidence.
 
 ### Epic Wave Topology
 
@@ -247,7 +348,7 @@ When `occurrences` reaches `>= 3`, StigmeRig sets `promotion_candidate` to `true
 `stigmerig traps` turns recurring blockers and anti-patterns into enforced static regex checks across 30+ polyglot file extensions.
 All trap commands run standalone in CI or developer checkouts without requiring an initialized `queue.db`.
 
-Seed opt-in starter packs (`generic`, `python`, `typescript`, `rust`, `go`, or `all`) when native linters are absent:
+Seed opt-in starter packs when native linters are absent:
 
 ```bash
 stigmerig traps seed --pack all
@@ -255,7 +356,20 @@ stigmerig traps verify
 stigmerig traps scan . --json
 ```
 
-Starter pack remediations cross-reference native linter rules (`ruff S110`, `@typescript-eslint/ban-ts-comment`, `clippy`, and `errcheck`).
+Available starter packs include `generic`, `python`, `typescript`, `rust`, `go`, and `verification`.
+The `verification` pack blocks unjustified skipped tests, blanket linter suppressions, and unresolved documentation placeholders.
+Remediations cite native static analyzer rules including `ruff PGH004`, `clippy`, and `eslint-comments`.
+
+For mature repositories, use baseline ratchets to suppress legacy violations:
+
+```bash
+stigmerig traps scan . --write-baseline .stigmerig/traps-baseline.json
+stigmerig traps scan . --baseline .stigmerig/traps-baseline.json
+```
+
+The baseline stores multiset counts per relative path, trap identifier, and snippet hash.
+Scans pass when existing violations match baseline counts and fail on net-new infractions.
+
 Promote harvested blocker candidates in-place by attaching a regex pattern, positive and negative fixtures, and prescriptive remediation (`>= 20` characters):
 
 ```bash
@@ -276,23 +390,42 @@ Pass `--rig-dir <path>` before any subcommand to target an isolated `.stigmerig`
 | :--- | :--- | :--- |
 | `stigmerig init` | Initialize SQLite databases, `Task_Board.md`, and ICM files. | `--path <dir>`, `--no-icm` |
 | `stigmerig task create` | Register a task in `queue.db` and scaffold its Markdown context. | `--id`, `--title`, `--parent`, `--archetype`, `--priority`, `--tags`, `--author` |
-| `stigmerig task list` | Query tasks ordered by priority and creation timestamp. | `--status <todo\|working\|done\|blocked>`, `--parent <id>` |
+| `stigmerig task list` | Query tasks ordered by priority and creation timestamp. | `--status <todo\|working\|review\|done\|blocked>`, `--parent <id>` |
 | `stigmerig task get` | Inspect full JSON metadata for a single task. | `--id` |
-| `stigmerig task claim` | Acquire an atomic CAS task lease with expiration TTL. | `--id`, `--agent`, `--ttl <seconds>` |
-| `stigmerig task done` | Close a task after independent verification and compute next rail step. | `--id`, `--agent`, `--verifier`, `--session-id`, `--evidence`, `--allow-self-approval` |
+| `stigmerig task claim` | Acquire an atomic CAS task lease with expiration TTL. | `--id`, `--agent`, `--ttl <seconds>`, `--force-backpressure` |
+| `stigmerig task review` | Submit a working task for review with receipts. | `--id`, `--agent`, `--summary`, `--verification-cmd`, `--diffstat`, `--evidence`, `--model` |
+| `stigmerig task approve` | Approve a reviewed task with an independent verifier. | `--id`, `--verifier`, `--session-id`, `--evidence`, `--model` |
+| `stigmerig task done` | Close a task after independent verification and compute next rail step. | `--id`, `--agent`, `--verifier`, `--session-id`, `--evidence`, `--model`, `--allow-self-approval` |
 | `stigmerig task fail` | Mark a task blocked and deduplicate its blocker signature in `traps.json`. | `--id`, `--agent`, `--reason` |
 | `stigmerig audit log` | Append a custom SHA-256 hash-chained entry to `audit.db`. | `--task`, `--action`, `--agent`, `--status`, `--payload` |
 | `stigmerig audit verify` | Validate genesis continuity and SHA-256 digests across `audit_log`. | None |
 | `stigmerig board sync` | Regenerate `<rig_dir>/Task_Board.md` from `queue.db`. | None |
 | `stigmerig telemetry sequence` | Emit a Mermaid sequence diagram of recorded agent handoffs. | `--task <id>`, `--output <file>` |
 | `stigmerig telemetry metrics` | Export task durations, Anti-DMV ratios, wave shapes, and recurring traps. | `--json`, `--output <file>` |
-| `stigmerig traps` | Seed, register, promote, dismiss, verify, and scan polyglot trap invariants. | `scan`, `verify`, `seed`, `register`, `promote`, `dismiss`, `--registry`, `--json` |
+| `stigmerig traps` | Seed, register, promote, dismiss, verify, and scan polyglot trap invariants. | `scan`, `verify`, `seed`, `register`, `promote`, `dismiss`, `--registry`, `--baseline`, `--write-baseline`, `--pack`, `--json` |
 
 Environment variables configure default runtime resolution:
 
 - **`STIGMERIG_ROOT`**: Overrides the default `.stigmerig` directory when `--rig-dir` is omitted.
+- **`STIGMERIG_MODEL`**: Sets fallback foundation model attribution for `task review`, `task approve`, and `task done` audit payloads.
 - **`STIGMERIG_SEAT`**: Sets explicit seat attribution in completion audit payloads (falls back to `AGENT_SEAT` or agent prefix).
 - **`STIGMERIG_SWARM_NAME`**: Customizes git author and committer prefixes for `WorktreeManager` and `WaveRunner` commits.
+
+### Policy Configuration (`.stigmerig/rig.json`)
+
+Newly initialized rigs scaffold `.stigmerig/rig.json` with default backpressure and Intentional Friction policies:
+
+```json
+{
+  "version": "0.1.0",
+  "icm_enabled": true,
+  "max_pending_review": 3,
+  "high_friction_tags": ["security", "migration", "infra", "release", "destructive"],
+  "high_friction_globs": [".github/workflows/**", "migrations/**"]
+}
+```
+
+Omitted keys disable each gate so existing rigs keep backward-compatible behavior until configured.
 
 ## Multi-Harness Integration Guide
 

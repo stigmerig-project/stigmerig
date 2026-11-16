@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from stigmerig.db import StigmeRigDB, _escape_md_cell
+from stigmerig.db import StigmeRigDB, _escape_md_cell, _is_self_approval
 
 
 VERIFY_ONLY_ARCHETYPES: frozenset[str] = frozenset({
@@ -39,6 +39,10 @@ _EVENT_TYPE_MAP: Dict[str, str] = {
     "AGENT CANCELLED": "cancelled",
     "TASK_CANCELLED": "cancelled",
     "CANCELLED": "cancelled",
+    "AGENT REVIEW": "review",
+    "TASK_REVIEW": "review",
+    "REVIEW_SUBMITTED": "review",
+    "REVIEW": "review",
     "SELF_EXECUTION_OVERRIDE": "self_execution_override",
 }
 
@@ -246,7 +250,7 @@ class TelemetryExporter:
             ts = _try_parse_iso(ev.get("timestamp"))
 
             if t_id not in tasks_map:
-                tasks_map[t_id] = {"created": None, "claimed": None, "completed": None}
+                tasks_map[t_id] = {"created": None, "claimed": None, "review": None, "completed": None}
             if ts is None:
                 continue
 
@@ -254,6 +258,8 @@ class TelemetryExporter:
                 tasks_map[t_id]["created"] = ts
             elif e_type == "claimed" and not tasks_map[t_id]["claimed"]:
                 tasks_map[t_id]["claimed"] = ts
+            elif e_type == "review":
+                tasks_map[t_id]["review"] = ts
             elif e_type == "completed":
                 tasks_map[t_id]["completed"] = ts
 
@@ -261,18 +267,23 @@ class TelemetryExporter:
         for t_id, data in tasks_map.items():
             t_created = data["created"]
             t_claimed = data["claimed"]
+            t_review = data["review"]
             t_completed = data["completed"]
 
             wait_sec = (t_claimed - t_created).total_seconds() if t_claimed and t_created else None
             exec_sec = (t_completed - t_claimed).total_seconds() if t_completed and t_claimed else None
+            review_sec = (t_completed - t_review).total_seconds() if t_completed and t_review else None
             total_sec = (t_completed - t_created).total_seconds() if t_completed and t_created else None
 
-            metrics.append({
+            entry: Dict[str, Any] = {
                 "task_id": t_id,
                 "wait_seconds": wait_sec,
                 "exec_seconds": exec_sec,
                 "total_seconds": total_sec,
-            })
+            }
+            if review_sec is not None:
+                entry["review_seconds"] = review_sec
+            metrics.append(entry)
 
         return metrics
 
@@ -302,6 +313,7 @@ class TelemetryExporter:
         completed_ts_by_task: Dict[str, datetime.datetime] = {}
         created_ts_by_task: Dict[str, datetime.datetime] = {}
         claimed_ts_by_task: Dict[str, List[datetime.datetime]] = {}
+        review_ts_by_task: Dict[str, datetime.datetime] = {}
         for ev in events:
             t_id = str(ev.get("task_id") or "").strip()
             if t_id and ev.get("event_type") == "completed":
@@ -313,6 +325,8 @@ class TelemetryExporter:
                 created_ts_by_task[t_id] = ts
             elif ev.get("event_type") == "claimed":
                 claimed_ts_by_task.setdefault(t_id, []).append(ts)
+            elif ev.get("event_type") == "review":
+                review_ts_by_task[t_id] = ts
             elif ev.get("event_type") == "completed":
                 completed_ts_by_task[t_id] = ts
         completed_duration_ids = {tid for tid in completed_ts_by_task if tid in created_ts_by_task or tid in claimed_ts_by_task}
@@ -363,6 +377,7 @@ class TelemetryExporter:
         claimants_by_task: Dict[str, set[str]] = {}
         blocked_leaf_ids: set[str] = set()
         force_claimed_leaf_ids: set[str] = set()
+        verified_completed_ids: set[str] = set()
         for ev in events:
             tid = str(ev.get("task_id") or "").strip()
             if not tid or tid not in leaf_ids:
@@ -376,6 +391,46 @@ class TelemetryExporter:
                     force_claimed_leaf_ids.add(tid)
             elif ev_type == "blocked":
                 blocked_leaf_ids.add(tid)
+            elif ev_type == "completed":
+                payload_d = _parse_payload_dict(ev.get("payload"))
+                verifier = str(payload_d.get("verifier") or "").strip()
+                implementer = str(payload_d.get("implementer") or ev.get("agent") or "").strip()
+                if verifier and not _is_self_approval(implementer, verifier) and not _is_self_approval(ev.get("agent"), verifier):
+                    verified_completed_ids.add(tid)
+
+        pending_review_tasks = sum(
+            1 for t in leaf_tasks if str(t.get("status") or "").strip().lower() == "review"
+        )
+        review_wait_pairs = [
+            (
+                (completed_ts_by_task[tid] - review_ts_by_task[tid]).total_seconds(),
+                (completed_ts_by_task[tid] - created_ts_by_task[tid]).total_seconds(),
+            )
+            for tid in review_ts_by_task
+            if tid in completed_ts_by_task
+            and tid in created_ts_by_task
+            and (completed_ts_by_task[tid] - created_ts_by_task[tid]).total_seconds() > 0
+        ]
+        review_wait_ratio = (
+            round(sum(r for r, _ in review_wait_pairs) / sum(t for _, t in review_wait_pairs), 4)
+            if review_wait_pairs
+            else 0.0
+        )
+        max_pending_cfg = self.db._load_rig_config().get("max_pending_review")
+        review_cap = max_pending_cfg if max_pending_cfg is not None else 3
+        review_bottleneck_alert = bool(pending_review_tasks >= review_cap or review_wait_ratio > 0.40)
+
+        completed_leaf_ids = {
+            t["id"]
+            for t in leaf_tasks
+            if " ".join(str(t.get("status") or "").split()).lower() in _COMPLETED_TASK_STATUSES
+            or t["id"] in completed_duration_ids
+            or t["id"] in completed_event_ids
+        }
+        unverified_completed_count = len(completed_leaf_ids - verified_completed_ids)
+        unverified_completion_rate = (
+            round(unverified_completed_count / completed_tasks, 4) if completed_tasks > 0 else 0.0
+        )
 
         rework_task_ids = (
             {tid for tid, actors in claimants_by_task.items() if len(actors) >= 2}
@@ -496,6 +551,10 @@ class TelemetryExporter:
             "ceremony_ratio": ceremony_ratio,
             "rework_tasks": rework_tasks,
             "rework_rate": rework_rate,
+            "pending_review_tasks": pending_review_tasks,
+            "review_wait_ratio": review_wait_ratio,
+            "review_bottleneck_alert": review_bottleneck_alert,
+            "unverified_completion_rate": unverified_completion_rate,
             "epics": epics_summary,
             "blocked_reasons": {
                 "by_reason": reason_counts,
@@ -546,6 +605,9 @@ class TelemetryExporter:
             f"- **Verify-Only Ratio (`verify_only_ratio`)**: {gov['verify_only_ratio']:.4f} (`dmv_alert`: `{gov['dmv_alert']}`)",
             f"- **Ceremony Ratio (`ceremony_ratio`)**: {gov['ceremony_ratio']:.4f} (overrides: {gov['self_execution_overrides']})",
             f"- **Rework Rate (`rework_rate`)**: {gov['rework_rate']:.4f} ({gov['rework_tasks']} / {gov['total_tasks']} leaf tasks)",
+            f"- **Pending Review Tasks (`pending_review_tasks`)**: {gov['pending_review_tasks']} (`review_bottleneck_alert`: `{gov['review_bottleneck_alert']}`)",
+            f"- **Review Wait Ratio (`review_wait_ratio`)**: {gov['review_wait_ratio']:.4f}",
+            f"- **Unverified Completion Rate (`unverified_completion_rate`)**: {gov['unverified_completion_rate']:.4f}",
             f"- **Recorded Traps**: {gov['blocked_reasons']['total_traps']} total, {len(gov['blocked_reasons']['recurring_candidates'])} recurring candidates",
         ])
 

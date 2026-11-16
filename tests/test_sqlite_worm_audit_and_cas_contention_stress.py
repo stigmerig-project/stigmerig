@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from stigmerig.db import GENESIS_HASH, StigmeRigDB, _is_self_approval, derive_seat
 
-SEAT_ENV_KEYS = ("STIGMERIG_SEAT", "AGENT_SEAT", "SEAT")
+SEAT_ENV_KEYS = ("STIGMERIG_SEAT", "AGENT_SEAT", "SEAT", "STIGMERIG_MODEL")
 
 
 def _build_writer_schedule(worker_idx: int, task_count: int = 24) -> list[tuple[str, bool]]:

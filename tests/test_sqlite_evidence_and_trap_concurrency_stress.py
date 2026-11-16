@@ -27,7 +27,7 @@ def _build_trap_schedule() -> list[tuple[str, str, str]]:
 
 
 def test_multithreaded_evidence_binding_retry_and_payload_hashes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    for env_key in ("STIGMERIG_SEAT", "AGENT_SEAT", "SEAT"):
+    for env_key in ("STIGMERIG_SEAT", "AGENT_SEAT", "SEAT", "STIGMERIG_MODEL"):
         monkeypatch.delenv(env_key, raising=False)
     ws, db = tmp_path / "ws", StigmeRigDB(rig_dir=tmp_path / "ws" / ".stigmerig")
     db.init_rig(scaffold_icm=False)

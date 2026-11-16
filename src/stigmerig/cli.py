@@ -15,7 +15,7 @@ from typing import Any, Optional, Sequence
 from stigmerig.db import TASK_ID_PATTERN, StigmeRigDB, _atomic_write_text, _is_self_approval, resolve_rig_dir
 from stigmerig.traps import add_traps_parser, run_traps_command, validate_traps_cli_args
 
-VALID_TASK_STATUSES = frozenset({"todo", "working", "done", "blocked", "cancelled", "canceled", "archived"})
+VALID_TASK_STATUSES = frozenset({"todo", "working", "review", "done", "blocked", "cancelled", "canceled", "archived"})
 
 
 def _is_link(path: Path) -> bool:
@@ -39,7 +39,7 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
                 s_item = str(os.fspath(item))
                 if "\x00" in s_item:
                     raise ValueError(f"--{name.replace('_', '-')} must not contain embedded NUL bytes")
-                if name not in ("id", "task", "parent") and _has_ctrl(s_item, allow_ws=name in ("title", "reason", "payload", "positive_fixture", "negative_fixture", "remediation", "forbidden")):
+                if name not in ("id", "task", "parent") and _has_ctrl(s_item, allow_ws=name in ("title", "reason", "payload", "positive_fixture", "negative_fixture", "remediation", "forbidden", "summary", "verification_cmd", "diffstat")):
                     raise ValueError(f"--{name.replace('_', '-')} must not contain control or non-printable Unicode characters")
     dir_checks = [(f"--{f.replace('_', '-')}", getattr(args, f, None)) for f in ("rig_dir", "path")]
     env_root = os.environ.get("STIGMERIG_ROOT") if dir_checks[0][1] is None and dir_checks[1][1] is None else None
@@ -59,7 +59,7 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
     priority = getattr(args, "priority", None)
     if priority is not None and (isinstance(priority, bool) or not isinstance(priority, int) or not (-(1 << 63) <= priority <= (1 << 63) - 1)):
         raise ValueError("--priority must be a 64-bit signed integer")
-    for field in ("title", "agent", "reason", "action", "status", "parent", "author", "archetype", "verifier", "session_id", "output"):
+    for field in ("title", "agent", "reason", "action", "status", "parent", "author", "archetype", "verifier", "session_id", "model", "output", "summary", "verification_cmd", "diffstat"):
         val = getattr(args, field, None)
         if val is not None and not str(os.fspath(val) if isinstance(val, os.PathLike) else val).strip():
             raise ValueError(f"--{field.replace('_', '-')} must not be empty or whitespace")
@@ -82,6 +82,9 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
     if getattr(args, "parent", None) is not None and getattr(args, "parent", None) == getattr(args, "id", None):
         raise ValueError("--parent must not equal --id")
     cmd, sub = getattr(args, "command", None), getattr(args, "subcommand", None)
+    if cmd == "task" and sub in ("done", "review", "approve") and getattr(args, "model", None) is None:
+        if (env_m := os.environ.get("STIGMERIG_MODEL")) is not None and env_m != "" and (not env_m.strip() or _has_ctrl(env_m)):
+            raise ValueError("STIGMERIG_MODEL must not be empty, whitespace, or contain control characters")
     if ":" in (getattr(args, "action", None) or "") or (cmd == "audit" and ":" in (getattr(args, "status", None) or "")):
         raise ValueError("audit log --action and --status must not contain ':'")
     if cmd == "task" and sub == "list" and getattr(args, "status", None) is not None and args.status not in VALID_TASK_STATUSES:
@@ -302,6 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tclaim.add_argument("--id", required=True, help="Task ID to claim")
     p_tclaim.add_argument("--agent", required=True, help="Agent claiming the task")
     p_tclaim.add_argument("--ttl", type=int, default=1800, help="Lease TTL in seconds (default 1800)")
+    p_tclaim.add_argument("--force-backpressure", action="store_true", help="Override review-queue backpressure")
 
     p_tdone = task_sub.add_parser("done", help="Complete a task with anti-self-approval gate")
     p_tdone.add_argument("--id", required=True, help="Task ID to mark done")
@@ -313,6 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass anti-self-approval enforcement",
     )
     p_tdone.add_argument("--session-id", default=None, help="Optional session or run identifier")
+    p_tdone.add_argument("--model", default=None, help="Optional foundation model identifier (falls back to STIGMERIG_MODEL)")
     p_tdone.add_argument(
         "--evidence",
         action="append",
@@ -320,6 +325,22 @@ def build_parser() -> argparse.ArgumentParser:
         dest="evidence",
         help="Repeatable path to evidence artifact to hash-bind on completion",
     )
+
+    p_trev = task_sub.add_parser("review", help="Submit a working task for review")
+    p_trev.add_argument("--id", required=True, help="Task ID to submit for review")
+    p_trev.add_argument("--agent", required=True, help="Agent submitting for review")
+    p_trev.add_argument("--summary", required=True, help="Summary of changes and verification")
+    p_trev.add_argument("--verification-cmd", default=None, help="Verification command run")
+    p_trev.add_argument("--diffstat", default=None, help="Diffstat summary")
+    p_trev.add_argument("--model", default=None, help="Optional foundation model identifier (falls back to STIGMERIG_MODEL)")
+    p_trev.add_argument("--evidence", action="append", default=None, dest="evidence", help="Repeatable evidence artifact path")
+
+    p_tapp = task_sub.add_parser("approve", help="Approve a task in review")
+    p_tapp.add_argument("--id", required=True, help="Task ID to approve")
+    p_tapp.add_argument("--verifier", required=True, help="Independent verifying agent")
+    p_tapp.add_argument("--session-id", default=None, help="Optional session or run identifier")
+    p_tapp.add_argument("--model", default=None, help="Optional foundation model identifier (falls back to STIGMERIG_MODEL)")
+    p_tapp.add_argument("--evidence", action="append", default=None, dest="evidence", help="Repeatable evidence artifact path")
 
     p_tfail = task_sub.add_parser("fail", help="Mark a task as blocked or failed")
     p_tfail.add_argument("--id", required=True, help="Task ID")
@@ -441,7 +462,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 0
 
             if args.subcommand == "claim":
-                ok = rig.claim_task(task_id=args.id, agent=args.agent, ttl_seconds=args.ttl)
+                ok = rig.claim_task(task_id=args.id, agent=args.agent, ttl_seconds=args.ttl, ignore_backpressure=args.force_backpressure)
                 if ok:
                     print(f"Task {args.id} claimed by {args.agent}")
                     return 0
@@ -456,6 +477,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     allow_self_approval=args.allow_self_approval,
                     session_id=getattr(args, "session_id", None),
                     evidence_paths=args.evidence,
+                    model_id=args.model,
                 )
                 if ok:
                     next_step = rig.get_next_workflow_step(args.id)
@@ -468,6 +490,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     print(json.dumps(res, indent=2))
                     return 0
                 print(f"[ERROR] Failed to complete task {args.id}: {msg}", file=sys.stderr)
+                return 1
+
+            if args.subcommand == "review":
+                ok, msg = rig.submit_for_review(
+                    task_id=args.id, agent=args.agent, summary=args.summary,
+                    verification_cmd=args.verification_cmd, diffstat=args.diffstat, evidence_paths=args.evidence,
+                    model_id=args.model,
+                )
+                if ok:
+                    print(json.dumps({"ok": True, "task_id": args.id, "message": msg}, indent=2))
+                    return 0
+                print(f"[ERROR] Failed to submit task {args.id} for review: {msg}", file=sys.stderr)
+                return 1
+
+            if args.subcommand == "approve":
+                ok, msg = rig.approve_review(
+                    task_id=args.id, verifier=args.verifier, session_id=args.session_id, evidence_paths=args.evidence,
+                    model_id=args.model,
+                )
+                if ok:
+                    print(json.dumps({"ok": True, "task_id": args.id, "message": msg, "next_workflow_step": rig.get_next_workflow_step(args.id)}, indent=2))
+                    return 0
+                print(f"[ERROR] Failed to approve task {args.id}: {msg}", file=sys.stderr)
                 return 1
 
             if args.subcommand == "fail":

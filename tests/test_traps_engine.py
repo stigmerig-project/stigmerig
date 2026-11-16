@@ -472,10 +472,10 @@ class TestMultilineScanningLocksAndPromotion(unittest.TestCase):
         self.assertTrue(dismiss_trap("TRAP-001", reason="Superseded", registry_path=reg_path))
         self.assertEqual(load_promoted_traps(reg_path, include_candidates=False), [])
 
-    def test_all_five_starter_packs_verify_and_self_scan_cleanly(self) -> None:
+    def test_all_six_starter_packs_verify_and_self_scan_cleanly(self) -> None:
         self.assertEqual(
             set(STARTER_TRAP_PACKS.keys()),
-            {"generic", "python", "typescript", "rust", "go"},
+            {"generic", "python", "typescript", "rust", "go", "verification"},
         )
 
         # Verify each individual pack and combined 'all' pack
@@ -485,6 +485,7 @@ class TestMultilineScanningLocksAndPromotion(unittest.TestCase):
             "typescript": "@typescript-eslint/ban-ts-comment",
             "rust": "clippy",
             "go": "errcheck",
+            "verification": "ruff PGH004",
         }
         for pack_name, expected_rule in expected_linters.items():
             pack_reg = self.tmp_dir / f"traps_{pack_name}.json"
@@ -503,17 +504,17 @@ class TestMultilineScanningLocksAndPromotion(unittest.TestCase):
         all_reg = self.tmp_dir / "traps_all.json"
         first_seed = seed_starter_traps(all_reg, pack="all", status="promoted")
         second_seed = seed_starter_traps(all_reg, pack="all", status="promoted")
-        self.assertEqual(len(first_seed), 8)
-        self.assertEqual(len(second_seed), 8)
+        self.assertEqual(len(first_seed), 11)
+        self.assertEqual(len(second_seed), 11)
 
         persisted_all = json.loads(all_reg.read_text(encoding="utf-8"))
-        self.assertEqual(len(persisted_all["traps"]), 8)
+        self.assertEqual(len(persisted_all["traps"]), 11)
 
         ok_all, errors_all, count_all = verify_trap_fixtures(all_reg)
         self.assertTrue(ok_all, errors_all)
-        self.assertEqual(count_all, 8)
+        self.assertEqual(count_all, 11)
 
-        # Scanning StigmeRig/src/stigmerig/traps.py itself with all 8 starter traps must yield 0 violations
+        # Scanning StigmeRig/src/stigmerig/traps.py itself with all 11 starter traps must yield 0 violations
         engine_file = Path(__file__).resolve().parent.parent / "src" / "stigmerig" / "traps.py"
         active_traps = load_promoted_traps(all_reg)
         self_violations = audit_file(engine_file, active_traps, repo_root=engine_file.parent.parent.parent)

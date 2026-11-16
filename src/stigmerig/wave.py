@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from stigmerig.db import StigmeRigDB, _is_self_approval, utc_now_iso
 
@@ -388,6 +388,7 @@ class WaveRunner:
         verifier: Optional[str] = None,
         archetype: Optional[str] = None,
         allow_self_approval: bool = False,
+        evidence_paths: Optional[Sequence[str | Path]] = None,
     ) -> Tuple[bool, str]:
         """Execute a single task inside an isolated worktree."""
         if not isinstance(task_id, str) or not TASK_ID_PATTERN.fullmatch(task_id):
@@ -415,6 +416,7 @@ class WaveRunner:
         task_title = str(task_record.get("title") or "").translate({0: None, 10: None, 13: None}).strip() or f"Task {task_id}"
 
         worktree_path: Optional[Path] = None
+        touched_paths: List[str] = []
         try:
             if (not use_arg_arch and db_arch is not None and _invalid_meta("ok", db_arch)) or _invalid_meta("ok", arch):
                 raise ValueError("Invalid or control-character archetype")
@@ -455,6 +457,43 @@ class WaveRunner:
                         capture_output=True,
                         check=True,
                     )
+                    cached_proc = subprocess.run(
+                        ["git", "diff", "--cached", "--name-only"],
+                        cwd=str(worktree_path),
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    committed_proc = subprocess.run(
+                        ["git", "diff", "--name-only", f"refs/heads/{target_branch}..{expected_ref}"],
+                        cwd=str(self.worktree_mgr.repo_root),
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    touched_paths = sorted({
+                        line.strip()
+                        for out in (cached_proc.stdout, committed_proc.stdout)
+                        for line in out.splitlines()
+                        if line.strip()
+                    })
+                    with self._db_lock:
+                        friction_triggered = self.db._matches_intentional_friction(task_record, touched_paths)
+                    if friction_triggered:
+                        friction_err: Optional[str] = None
+                        if allow_self_approval:
+                            friction_err = f"Self-approval forbidden by intentional friction gate on task '{task_id}'."
+                        elif not evidence_paths:
+                            friction_err = f"Intentional friction gate requires non-empty SHA-256 evidence on task '{task_id}'."
+                        else:
+                            try:
+                                self.db._validate_and_hash_evidence(evidence_paths)
+                            except Exception as ev_exc:
+                                friction_err = str(ev_exc)
+                        if friction_err is not None:
+                            with self._db_lock:
+                                self.db.fail_task(task_id, agent=agent, reason=friction_err)
+                            return False, friction_err
                     diff_proc = subprocess.run(
                         ["git", "diff", "--cached", "--quiet"],
                         cwd=str(worktree_path),
@@ -504,7 +543,12 @@ class WaveRunner:
 
             with self._db_lock:
                 return self.db.complete_task(
-                    task_id=task_id, agent=agent, verifier=verifier, allow_self_approval=allow_self_approval
+                    task_id=task_id,
+                    agent=agent,
+                    verifier=verifier,
+                    allow_self_approval=allow_self_approval,
+                    evidence_paths=evidence_paths,
+                    touched_paths=touched_paths,
                 )
         except Exception as exc:
             err_msg = f"{exc}: {d}" if isinstance(exc, subprocess.CalledProcessError) and (d := _proc_detail(exc)) and d not in str(exc) else str(exc)
@@ -545,6 +589,7 @@ class WaveRunner:
                     verifier=verifier,
                     archetype=arch,
                     allow_self_approval=allow_self_approval,
+                    evidence_paths=spec.get("evidence_paths"),
                 )
                 return t_id, (ok, msg)
 

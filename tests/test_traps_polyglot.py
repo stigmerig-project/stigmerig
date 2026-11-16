@@ -206,20 +206,20 @@ class TestStandaloneUninitializedCliScanAndVerify(_HermeticTempTestCase):
         self.assertEqual(rc_seed, 0, err_seed)
         seed_report = json.loads(out_seed)
         self.assertTrue(seed_report["ok"])
-        self.assertEqual(seed_report["seeded_count"], 8)
+        self.assertEqual(seed_report["seeded_count"], 11)
 
         # 3. Verify fixtures via CLI without queue.db or audit.db.
         rc_ver, out_ver, err_ver = self.run_cli(["traps", "verify", "--json"], cwd=repo)
         self.assertEqual(rc_ver, 0, err_ver)
         ver_report = json.loads(out_ver)
         self.assertTrue(ver_report["ok"])
-        self.assertEqual(ver_report["verified_traps"], 8)
+        self.assertEqual(ver_report["verified_traps"], 11)
         self.assertEqual(ver_report["errors"], [])
 
         # 4. Scan clean polyglot repository and verify zero violations.
         rc_scan_txt, out_scan_txt, err_scan_txt = self.run_cli(["traps", "scan", "."], cwd=repo)
         self.assertEqual(rc_scan_txt, 0, err_scan_txt)
-        self.assertIn("[PASS] Scanned 7 file(s) against 8 active trap(s): zero violations.", out_scan_txt)
+        self.assertIn("[PASS] Scanned 7 file(s) against 11 active trap(s): zero violations.", out_scan_txt)
 
         # Confirm zero SQLite databases were created.
         self.assertTrue((repo / ".stigmerig" / "traps.json").is_file())
@@ -299,15 +299,16 @@ class TestStandaloneUninitializedCliScanAndVerify(_HermeticTempTestCase):
 
 
 class TestStarterPacksAndMultilineCliFixtures(_HermeticTempTestCase):
-    """Verify all 5 starter packs, multiline CLI fixtures, stub rejections, and trace-preserving promotion."""
+    """Verify all 6 starter packs, multiline CLI fixtures, stub rejections, and trace-preserving promotion."""
 
-    def test_all_five_starter_packs_and_combined_seed_pass_verify(self) -> None:
+    def test_all_six_starter_packs_and_combined_seed_pass_verify(self) -> None:
         expected_counts = {
             "generic": 1,
             "python": 2,
             "typescript": 2,
             "rust": 2,
             "go": 1,
+            "verification": 3,
         }
         for pack_name, expected_len in expected_counts.items():
             reg_path = self.tmp_dir / f"pack_{pack_name}.json"
@@ -338,7 +339,7 @@ class TestStarterPacksAndMultilineCliFixtures(_HermeticTempTestCase):
             ],
         )
         self.assertEqual(rc_seed, 0, err_seed)
-        self.assertEqual(json.loads(out_seed)["seeded_count"], 8)
+        self.assertEqual(json.loads(out_seed)["seeded_count"], 11)
 
         ok_all, errors_all, count_all = verify_trap_fixtures(
             all_reg,
@@ -346,7 +347,7 @@ class TestStarterPacksAndMultilineCliFixtures(_HermeticTempTestCase):
             require_prescriptive_on_promoted=True,
         )
         self.assertTrue(ok_all, errors_all)
-        self.assertEqual(count_all, 8)
+        self.assertEqual(count_all, 11)
 
         rc_ver, _, err_ver = self.run_cli(
             [
@@ -360,6 +361,99 @@ class TestStarterPacksAndMultilineCliFixtures(_HermeticTempTestCase):
             ],
         )
         self.assertEqual(rc_ver, 0, err_ver)
+
+    def test_verification_pack_positive_and_negative_polyglot_cases(self) -> None:
+        rig_dir = self.tmp_dir / ".stigmerig"
+        reg_path = self.tmp_dir / "verification_traps.json"
+        rc_seed, _, err_seed = self.run_cli(
+            [
+                "--rig-dir",
+                str(rig_dir),
+                "traps",
+                "seed",
+                "--pack",
+                "verification",
+                "--registry",
+                str(reg_path),
+                "--json",
+            ],
+        )
+        self.assertEqual(rc_seed, 0, err_seed)
+
+        proj = self.tmp_dir / "ver_proj"
+        (proj / "src").mkdir(parents=True)
+        (proj / "tests").mkdir(parents=True)
+        (proj / "docs").mkdir(parents=True)
+
+        # Positive violations for TRAP-VER-001 (skipped tests across Python, JS, Rust)
+        (proj / "tests" / "test_sample.py").write_text(
+            "@unittest.skip(\"\")\ndef test_a():\n    pass\n\n@pytest.mark.skip\ndef test_b():\n    pass\n",
+            encoding="utf-8",
+        )
+        (proj / "tests" / "sample.test.ts").write_text(
+            "it.skip('flaky', () => {});\ntest.skip('todo', () => {});\n",
+            encoding="utf-8",
+        )
+        (proj / "tests" / "lib_test.rs").write_text(
+            "#[test]\n#[ignore]\nfn skipped_rust() {}\n",
+            encoding="utf-8",
+        )
+        # Positive violations for TRAP-VER-002 (blanket linter suppressions in non-test code)
+        (proj / "src" / "app.py").write_text("x = 1  # noqa\n", encoding="utf-8")
+        (proj / "src" / "app.ts").write_text("// eslint-disable\nconst a = 1;\n", encoding="utf-8")
+        (proj / "src" / "app.go").write_text("package main\n// nolint\nfunc main() {}\n", encoding="utf-8")
+        # Positive violations for TRAP-VER-003 (unresolved placeholders in non-test Markdown)
+        (proj / "docs" / "notes.md").write_text(
+            "Claim A [CITATION NEEDED].\nTODO: cite benchmark.\nMetric [UNVERIFIED].\n",
+            encoding="utf-8",
+        )
+
+        # Negative (compliant) files
+        (proj / "tests" / "test_clean.py").write_text(
+            "@pytest.mark.skip(reason='Blocked on #99')\ndef test_ok():\n    pass\n",
+            encoding="utf-8",
+        )
+        (proj / "tests" / "clean_test.rs").write_text(
+            "#[test]\n#[ignore = \"requires local GPU\"]\nfn gpu_only() {}\n",
+            encoding="utf-8",
+        )
+        (proj / "src" / "clean.py").write_text("x = 1  # noqa: E501\n", encoding="utf-8")
+        (proj / "src" / "clean.ts").write_text("// eslint-disable-next-line no-console\nconsole.log(1);\n", encoding="utf-8")
+        (proj / "src" / "clean.go").write_text("package main\n// nolint:errcheck\nfunc clean() {}\n", encoding="utf-8")
+        (proj / "docs" / "clean.md").write_text("Claim A (Smith et al., 2026).\n", encoding="utf-8")
+
+        rc_scan, out_scan, _ = self.run_cli(
+            [
+                "--rig-dir",
+                str(rig_dir),
+                "traps",
+                "scan",
+                "--registry",
+                str(reg_path),
+                str(proj),
+                "--json",
+            ],
+        )
+        self.assertEqual(rc_scan, 1)
+        report = json.loads(out_scan)
+        hits_by_file = {(Path(v["file"]).name, v["trap_id"]) for v in report["violations"]}
+        self.assertEqual(
+            hits_by_file,
+            {
+                ("test_sample.py", "TRAP-VER-001"),
+                ("sample.test.ts", "TRAP-VER-001"),
+                ("lib_test.rs", "TRAP-VER-001"),
+                ("app.py", "TRAP-VER-002"),
+                ("app.ts", "TRAP-VER-002"),
+                ("app.go", "TRAP-VER-002"),
+                ("notes.md", "TRAP-VER-003"),
+            },
+        )
+        # Ensure clean files produced zero violations
+        flagged_names = {Path(v["file"]).name for v in report["violations"]}
+        self.assertTrue(
+            flagged_names.isdisjoint({"test_clean.py", "clean_test.rs", "clean.py", "clean.ts", "clean.go", "clean.md"})
+        )
 
     def test_multiline_cli_register_and_promote_and_stub_remediation_rejections(self) -> None:
         rig_dir = self.tmp_dir / ".stigmerig"

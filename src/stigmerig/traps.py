@@ -6,6 +6,7 @@ import argparse
 from contextlib import contextmanager
 import datetime
 from functools import lru_cache
+import hashlib
 import json
 import math
 import os
@@ -285,6 +286,95 @@ STARTER_TRAP_PACKS: Dict[str, Tuple[Dict[str, Any], ...]] = {
             "fixtures": {
                 "positive": "if " + "err != nil {\n}",
                 "negative": "if err != nil {\n\treturn fmt.Errorf(\"write frame: %w\", err)\n}",
+            },
+        },
+    ),
+    "verification": (
+        {
+            "trap_id": "TRAP-VER-001",
+            "domain": "verification-hygiene",
+            "title": "Unjustified Skipped Test",
+            "trigger_pattern": (
+                r"@unittest\.skip\(\s*(?:['\"]\s*['\"]\s*)?\)"
+                r"|@(?:pytest\.)?mark\.skip\b(?:\(\s*(?:reason\s*=\s*['\"]\s*['\"]\s*)?\))?(?!\s*\()"
+                r"|\b(?:it|test)\.skip\("
+                r"|#\[\s*ignore\s*\]"
+            ),
+            "forbidden_claim_or_action": (
+                "Skipping tests without a tracked reason via \x40unittest.skip(\"\"), bare \x40pytest.mark.skip, "
+                "it.skip\x28), test.skip\x28), or bare \x23[ignore]."
+            ),
+            "remediation": (
+                "Fix the failing test or document a tracked reason using skip(reason=...) in Python, "
+                "eslint-plugin-jest/no-disabled-tests rules in JS/TS, or clippy::ignore_without_reason in Rust."
+            ),
+            "match_mode": "line",
+            "target_globs": [
+                "**/*.py",
+                "**/*.ts",
+                "**/*.tsx",
+                "**/*.js",
+                "**/*.jsx",
+                "**/*.mjs",
+                "**/*.cjs",
+                "**/*.rs",
+            ],
+            "fixtures": {
+                "positive": "\x40pytest.mark.skip\ndef test_flaky_checkout():\n    assert True",
+                "negative": "\x40pytest.mark.skip(reason='Blocked on upstream fix #42')\ndef test_flaky_checkout():\n    assert True",
+            },
+        },
+        {
+            "trap_id": "TRAP-VER-002",
+            "domain": "verification-hygiene",
+            "title": "Blanket Linter Suppression",
+            "trigger_pattern": (
+                r"#\s*noqa\b(?!\s*:\s*[A-Za-z0-9_-]+)"
+                r"|(?://|/\*)\s*eslint-disable(?:-next-line|-line)?(?![A-Za-z0-9_-])(?![ \t]+[A-Za-z0-9_@/])"
+                r"|//\s*nolint\b(?!\s*:\s*[A-Za-z0-9_,-]+)"
+            ),
+            "forbidden_claim_or_action": (
+                "Using bare \x23 noqa, bare /\x2f eslint-disable, or bare /\x2f nolint comments without scoping specific rule codes."
+            ),
+            "remediation": (
+                "Fix the underlying diagnostic or scope the suppression to an explicit rule code (such as \x23 noqa: E501) "
+                "per ruff PGH004, eslint-comments/no-unlimited-disable, and nolintlint."
+            ),
+            "match_mode": "line",
+            "target_globs": [
+                "**/*.py",
+                "**/*.pyi",
+                "**/*.ts",
+                "**/*.tsx",
+                "**/*.js",
+                "**/*.jsx",
+                "**/*.mjs",
+                "**/*.cjs",
+                "**/*.go",
+                *_NON_TEST_CODE_GLOBS,
+            ],
+            "fixtures": {
+                "positive": "val = compute()  \x23 noqa",
+                "negative": "val = compute()  \x23 noqa: E501",
+            },
+        },
+        {
+            "trap_id": "TRAP-VER-003",
+            "domain": "verification-hygiene",
+            "title": "Unresolved Citation or Verification Placeholder",
+            "trigger_pattern": r"(?i)\[CITATION NEEDED\]|\bTODO:\s*cite\b|\[UNVERIFIED\]",
+            "forbidden_claim_or_action": (
+                "Leaving unresolved \x5bCITATION NEEDED\x5d, TODO:\x20cite, or \x5bUNVERIFIED\x5d placeholders in Markdown documentation."
+            ),
+            "remediation": (
+                "Replace placeholder tags with a verified primary-source citation, file-and-line reference, "
+                "or [INFERENCE: LOW | MEDIUM | HIGH] uncertainty label."
+            ),
+            "match_mode": "line",
+            "target_globs": ["**/*.md", "**/*.mdx", *_NON_TEST_CODE_GLOBS],
+            "fixtures": {
+                "positive": "Benchmark latency improved by 40% \x5bCITATION NEEDED\x5d.",
+                "negative": "Benchmark latency improved by 40% (Smith et al., 2026, Table 2).",
             },
         },
     ),
@@ -1083,9 +1173,17 @@ def scan_paths(
     repo_root: Optional[Path] = None,
     excluded_filenames: Sequence[str] = DEFAULT_EXCLUDED_FILENAMES,
     max_file_size: int = MAX_FILE_SIZE,
+    excluded_paths: Sequence[Path | str] = (),
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """Scan a sequence of files or directories and return (scanned_count, violations)."""
     excluded_set = set(excluded_filenames)
+    excluded_resolved: set[Path] = set()
+    for ep in excluded_paths:
+        ep_path = Path(ep)
+        try:
+            excluded_resolved.add(ep_path.resolve())
+        except OSError:
+            excluded_resolved.add(ep_path)
     scanned_count = 0
     all_violations: List[Dict[str, Any]] = []
 
@@ -1094,6 +1192,12 @@ def scan_paths(
         if p.is_file():
             if p.name in excluded_set or _is_link_or_junction(p):
                 continue
+            try:
+                if p.resolve() in excluded_resolved:
+                    continue
+            except OSError:
+                if p in excluded_resolved:
+                    continue
             try:
                 if p.stat().st_size > max_file_size:
                     continue
@@ -1124,6 +1228,12 @@ def scan_paths(
                 max_file_size=max_file_size,
             )
             for f_path in files:
+                try:
+                    if f_path.resolve() in excluded_resolved:
+                        continue
+                except OSError:
+                    if f_path in excluded_resolved:
+                        continue
                 scanned_count += 1
                 all_violations.extend(
                     audit_file(
@@ -1739,6 +1849,15 @@ def validate_traps_cli_args(args: argparse.Namespace, rig_dir: Optional[Path] = 
             if any(_bad_trap_path_part(part) for part in (*cand.parts, *abs_cand.parts)):
                 raise ValueError(f"Scan path '{s_path}' must not target '.git' or '.env' paths")
 
+        raw_write_baseline = getattr(args, "write_baseline", None)
+        raw_baseline = getattr(args, "baseline", None)
+        if raw_write_baseline is not None and raw_baseline is not None:
+            raise ValueError("--write-baseline and --baseline cannot be used together")
+        if raw_write_baseline is not None:
+            _resolve_validated_registry_path(raw_write_baseline, rig_dir)
+        if raw_baseline is not None:
+            _resolve_validated_registry_path(raw_baseline, rig_dir)
+
     return reg_path
 
 
@@ -1775,6 +1894,18 @@ def add_traps_parser(subparsers: Any) -> None:
         action="store_true",
         help="Emit structured JSON scan report",
     )
+    p_scan.add_argument(
+        "--write-baseline",
+        default=None,
+        dest="write_baseline",
+        help="Write current scan violation fingerprints to a baseline JSON file",
+    )
+    p_scan.add_argument(
+        "--baseline",
+        default=None,
+        dest="baseline",
+        help="Path to baseline JSON file; suppress recorded violation counts and fail only on new or excess violations",
+    )
 
     p_verify = traps_sub.add_parser(
         "verify",
@@ -1804,7 +1935,7 @@ def add_traps_parser(subparsers: Any) -> None:
         "--pack",
         required=True,
         choices=[*STARTER_TRAP_PACKS.keys(), "all"],
-        help="Starter pack to seed (generic, python, typescript, rust, go, all)",
+        help="Starter pack to seed (generic, python, typescript, rust, go, verification, all)",
     )
     p_seed.add_argument(
         "--status",
@@ -1997,12 +2128,137 @@ def _entry_lacks_code_fixtures(reg_path: Path, trap_id: str) -> bool:
     return False
 
 
+def _violation_rel_posix(file_path_str: str, repo_root: Optional[Path]) -> str:
+    """Return a normalized POSIX relative path for baseline fingerprinting."""
+    f_path = Path(file_path_str)
+    try:
+        resolved = f_path.resolve()
+    except OSError:
+        resolved = f_path
+
+    candidates: List[Path] = []
+    if repo_root is not None:
+        try:
+            candidates.append(repo_root.resolve())
+        except OSError:
+            candidates.append(repo_root)
+    try:
+        candidates.append(Path.cwd().resolve())
+    except OSError:
+        pass
+
+    for anchor in candidates:
+        try:
+            return resolved.relative_to(anchor).as_posix()
+        except ValueError:
+            continue
+    return PurePosixPath(f_path.as_posix()).as_posix()
+
+
+def _violation_fingerprint(
+    violation: Mapping[str, Any],
+    repo_root: Optional[Path],
+) -> Tuple[str, str, str]:
+    """Compute `(posix_rel_path, trap_id, sha256(snippet))` for a trap violation."""
+    rel_posix = _violation_rel_posix(str(violation.get("file") or ""), repo_root)
+    trap_id = str(violation.get("trap_id") or "")
+    snippet = str(violation.get("snippet") or "")
+    digest = hashlib.sha256(snippet.encode("utf-8")).hexdigest()
+    return (rel_posix, trap_id, digest)
+
+
+def _write_traps_baseline(
+    baseline_path: Path,
+    fingerprinted: Sequence[Tuple[Dict[str, Any], Tuple[str, str, str]]],
+) -> Dict[str, Any]:
+    """Write multiset violation fingerprint counts as sorted JSON atomically."""
+    counts: Dict[Tuple[str, str, str], int] = {}
+    for _, fp in fingerprinted:
+        counts[fp] = counts.get(fp, 0) + 1
+
+    entries = [
+        {
+            "count": count,
+            "file": fp[0],
+            "snippet_sha256": fp[2],
+            "trap_id": fp[1],
+        }
+        for fp, count in sorted(counts.items())
+    ]
+    payload: Dict[str, Any] = {
+        "entries": entries,
+        "version": "1.0.0",
+    }
+    _atomic_write_text(baseline_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return payload
+
+
+def _load_traps_baseline(baseline_path: Path) -> Dict[Tuple[str, str, str], int]:
+    """Load multiset violation fingerprint counts from a baseline JSON file."""
+    raw = json.loads(baseline_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not isinstance(raw.get("entries"), list):
+        raise ValueError(f"Invalid trap baseline structure in {baseline_path}: expected 'entries' list")
+
+    counts: Dict[Tuple[str, str, str], int] = {}
+    for entry in raw["entries"]:
+        if not isinstance(entry, dict):
+            raise ValueError(f"Invalid baseline entry in {baseline_path}: expected object")
+        rel_file = entry.get("file")
+        trap_id = entry.get("trap_id")
+        snippet_sha = entry.get("snippet_sha256")
+        count_val = entry.get("count")
+        if (
+            not isinstance(rel_file, str)
+            or not isinstance(trap_id, str)
+            or not isinstance(snippet_sha, str)
+            or not isinstance(count_val, int)
+            or isinstance(count_val, bool)
+            or count_val < 0
+        ):
+            raise ValueError(f"Invalid baseline entry fields in {baseline_path}")
+        fp = (rel_file, trap_id, snippet_sha)
+        counts[fp] = counts.get(fp, 0) + count_val
+    return counts
+
+
 def run_traps_command(args: argparse.Namespace, rig_dir: Path) -> int:
     """Execute a `stigmerig traps` subcommand and return an exit status code."""
     reg_path = validate_traps_cli_args(args, rig_dir)
     sub = args.subcommand
 
     if sub == "scan":
+        raw_write_baseline = getattr(args, "write_baseline", None)
+        raw_baseline = getattr(args, "baseline", None)
+        write_baseline_path = (
+            _resolve_validated_registry_path(raw_write_baseline, rig_dir)
+            if raw_write_baseline is not None
+            else None
+        )
+        baseline_path = (
+            _resolve_validated_registry_path(raw_baseline, rig_dir)
+            if raw_baseline is not None
+            else None
+        )
+
+        baseline_counts: Optional[Dict[Tuple[str, str, str], int]] = None
+        if baseline_path is not None:
+            if not baseline_path.exists():
+                msg = f"Baseline file not found: {baseline_path}"
+                if args.json:
+                    print(json.dumps({"ok": False, "error": msg, "baseline": str(baseline_path)}, indent=2))
+                else:
+                    print(f"[ERROR] {msg}", file=sys.stderr)
+                return 1
+            try:
+                baseline_counts = _load_traps_baseline(baseline_path)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                msg = f"Failed to load baseline {baseline_path}: {exc}"
+                if args.json:
+                    print(json.dumps({"ok": False, "error": msg, "baseline": str(baseline_path)}, indent=2))
+                else:
+                    print(f"[ERROR] {msg}", file=sys.stderr)
+                return 1
+
         ws_root: Optional[Path] = None
         try:
             if rig_dir.parent.exists():
@@ -2035,9 +2291,12 @@ def run_traps_command(args: argparse.Namespace, rig_dir: Path) -> int:
         traps = ordered_traps
 
         raw_targets = args.paths if args.paths else ["."]
+        active_baseline = write_baseline_path or baseline_path
+        excluded_scan_paths: Tuple[Path, ...] = (active_baseline,) if active_baseline is not None else ()
 
         total_scanned = 0
         all_violations: List[Dict[str, Any]] = []
+        fingerprinted_violations: List[Tuple[Dict[str, Any], Tuple[str, str, str]]] = []
         for raw_target in raw_targets:
             target_p = Path(raw_target)
             if not target_p.exists():
@@ -2052,9 +2311,50 @@ def run_traps_command(args: argparse.Namespace, rig_dir: Path) -> int:
                 eff_root = resolved_p
             else:
                 eff_root = None
-            scanned_n, viols = scan_paths([target_p], traps, repo_root=eff_root)
+            scanned_n, viols = scan_paths(
+                [target_p],
+                traps,
+                repo_root=eff_root,
+                excluded_paths=excluded_scan_paths,
+            )
             total_scanned += scanned_n
             all_violations.extend(viols)
+            for viol in viols:
+                fingerprinted_violations.append((viol, _violation_fingerprint(viol, eff_root)))
+
+        if write_baseline_path is not None:
+            payload = _write_traps_baseline(write_baseline_path, fingerprinted_violations)
+            if args.json:
+                report = {
+                    "ok": True,
+                    "registry": str(discovered_regs[0] if len(discovered_regs) == 1 else reg_path),
+                    "registries": [str(p) for p in discovered_regs],
+                    "active_traps": len(traps),
+                    "scanned_files": total_scanned,
+                    "baseline_written": str(write_baseline_path),
+                    "baselined_fingerprints": len(payload["entries"]),
+                    "baselined_violations": len(all_violations),
+                }
+                print(json.dumps(report, indent=2))
+                return 0
+            print(
+                f"[PASS] Wrote trap baseline ({len(all_violations)} violation(s) across "
+                f"{len(payload['entries'])} fingerprint(s)) to {write_baseline_path}"
+            )
+            return 0
+
+        suppressed_count = 0
+        if baseline_counts is not None:
+            remaining_budget = dict(baseline_counts)
+            excess_violations: List[Dict[str, Any]] = []
+            for viol, fp in fingerprinted_violations:
+                avail = remaining_budget.get(fp, 0)
+                if avail > 0:
+                    remaining_budget[fp] = avail - 1
+                    suppressed_count += 1
+                else:
+                    excess_violations.append(viol)
+            all_violations = excess_violations
 
         if args.json:
             report: Dict[str, Any] = {
@@ -2065,6 +2365,9 @@ def run_traps_command(args: argparse.Namespace, rig_dir: Path) -> int:
                 "scanned_files": total_scanned,
                 "violations": all_violations,
             }
+            if baseline_path is not None:
+                report["baseline"] = str(baseline_path)
+                report["suppressed_violations"] = suppressed_count
             print(json.dumps(report, indent=2))
             return 1 if all_violations else 0
 
@@ -2081,6 +2384,13 @@ def run_traps_command(args: argparse.Namespace, rig_dir: Path) -> int:
                 file=sys.stderr,
             )
             return 1
+
+        if baseline_path is not None:
+            print(
+                f"[PASS] Scanned {total_scanned} file(s) against {len(traps)} active trap(s): "
+                f"zero new violations ({suppressed_count} suppressed by baseline)."
+            )
+            return 0
 
         print(
             f"[PASS] Scanned {total_scanned} file(s) against {len(traps)} active trap(s): zero violations."

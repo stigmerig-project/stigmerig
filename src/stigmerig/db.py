@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import datetime
+import fnmatch
 import hashlib
 import json
 import logging
@@ -52,6 +53,12 @@ def _atomic_write_text(path: Path, content: str) -> None:
         Path(tmp_name).unlink(missing_ok=True)
         raise
 WORKFLOW_RAILS: Tuple[str, ...] = ("diff_synthesizer", "unit_tester", "policy_gatekeeper")
+VERIFY_ONLY_ARCHETYPES: frozenset[str] = frozenset({
+    "unit_tester",
+    "prose_auditor",
+    "policy_gatekeeper",
+    "topology_reader",
+})
 TASK_ID_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _TRAP_STOP_WORDS: frozenset[str] = frozenset({
     "with", "from", "that", "this", "have", "been", "were", "when", "what",
@@ -104,9 +111,49 @@ Active multi-agent coordination environment managed by StigmeRig.
 
 DEFAULT_RIG_JSON_TEMPLATE = """{
   "version": "0.1.0",
-  "icm_enabled": true
+  "icm_enabled": true,
+  "max_pending_review": 3,
+  "high_friction_tags": [
+    "security",
+    "migration",
+    "infra",
+    "release",
+    "destructive"
+  ]
 }
 """
+
+
+def _match_segment_glob(path_str: str, pattern_str: str) -> bool:
+    """Match a POSIX path against a glob pattern with segment-aware * and **."""
+    norm_path = path_str.strip().replace("\\", "/").lstrip("./").strip("/")
+    norm_pat = pattern_str.strip().replace("\\", "/").lstrip("./").strip("/")
+    if not norm_path or not norm_pat:
+        return False
+
+    path_parts = [p for p in norm_path.split("/") if p]
+    if "/" not in norm_pat and norm_pat != "**":
+        return fnmatch.fnmatchcase(path_parts[-1], norm_pat)
+
+    pat_parts = [p for p in norm_pat.split("/") if p]
+    memo: Dict[Tuple[int, int], bool] = {}
+
+    def _match(pi: int, si: int) -> bool:
+        key = (pi, si)
+        if key in memo:
+            return memo[key]
+        if pi == len(pat_parts) and si == len(path_parts):
+            res = True
+        elif pi < len(pat_parts) and pat_parts[pi] == "**":
+            res = _match(pi + 1, si) or (si < len(path_parts) and _match(pi, si + 1))
+        elif pi == len(pat_parts) or si == len(path_parts):
+            res = False
+        else:
+            res = fnmatch.fnmatchcase(path_parts[si], pat_parts[pi]) and _match(pi + 1, si + 1)
+        memo[key] = res
+        return res
+
+    return _match(0, 0)
 
 
 def derive_seat(agent: Optional[str] = None) -> str:
@@ -122,6 +169,28 @@ def derive_seat(agent: Optional[str] = None) -> str:
                     return part
         return agent.strip()
     return "default"
+
+
+def _validate_model_string(value: str, label: str) -> str:
+    """Validate and strip a non-empty printable model identifier."""
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or any(c in value for c in ("\r", "\n", "\t", "\x00"))
+        or not value.isprintable()
+    ):
+        raise ValueError(f"{label} must be a non-empty printable string")
+    return value.strip()
+
+
+def resolve_model_id(model_id: Optional[str] = None) -> Optional[str]:
+    """Validate explicit model_id or fall back to STIGMERIG_MODEL environment variable."""
+    if model_id is not None:
+        return _validate_model_string(model_id, "model_id")
+    env_model = os.environ.get("STIGMERIG_MODEL")
+    if env_model is None or env_model == "":
+        return None
+    return _validate_model_string(env_model, "STIGMERIG_MODEL")
 
 
 def _is_self_approval(actor: Optional[str], verifier: Optional[str]) -> bool:
@@ -227,6 +296,79 @@ class StigmeRigDB:
         self.board_path = self.rig_dir / "Task_Board.md"
         with _RIG_LOCKS_GUARD:
             self._lock = _RIG_LOCKS.setdefault(str(self.rig_dir), threading.RLock())
+
+    def _load_rig_config(self) -> Dict[str, Any]:
+        """Parse optional review backpressure and intentional friction settings from rig.json."""
+        defaults: Dict[str, Any] = {
+            "max_pending_review": None,
+            "high_friction_tags": frozenset(),
+            "high_friction_globs": (),
+        }
+        rig_json = self.rig_dir / "rig.json"
+        if not rig_json.is_file():
+            return defaults
+
+        try:
+            raw = json.loads(rig_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid rig.json at {rig_json}: {exc}") from exc
+
+        if not isinstance(raw, dict):
+            raise ValueError(f"Invalid rig.json at {rig_json}: root must be a JSON object")
+
+        max_pending = raw.get("max_pending_review")
+        if max_pending is not None:
+            if isinstance(max_pending, bool) or not isinstance(max_pending, int) or max_pending < 0:
+                raise ValueError(f"Invalid max_pending_review in rig.json: {max_pending!r}")
+            defaults["max_pending_review"] = max_pending
+
+        raw_tags = raw.get("high_friction_tags")
+        if raw_tags is not None:
+            if not isinstance(raw_tags, list) or any(not isinstance(t, str) or not t.strip() for t in raw_tags):
+                raise ValueError("Invalid high_friction_tags in rig.json: must be a list of non-empty strings")
+            defaults["high_friction_tags"] = frozenset(t.strip().lower() for t in raw_tags)
+
+        raw_globs = raw.get("high_friction_globs")
+        if raw_globs is not None:
+            if not isinstance(raw_globs, list) or any(not isinstance(g, str) or not g.strip() for g in raw_globs):
+                raise ValueError("Invalid high_friction_globs in rig.json: must be a list of non-empty strings")
+            defaults["high_friction_globs"] = tuple(g.strip().replace("\\", "/") for g in raw_globs)
+
+        return defaults
+
+    @staticmethod
+    def _validate_touched_paths(touched_paths: Optional[Sequence[str | Path]]) -> Tuple[str, ...]:
+        """Validate and normalize touched_paths into POSIX strings."""
+        if touched_paths is None:
+            return ()
+        if isinstance(touched_paths, (str, bytes, bytearray, Path)) or not isinstance(touched_paths, Sequence):
+            raise ValueError("touched_paths must be a sequence of paths, not a bare string/bytes")
+        normalized: List[str] = []
+        for item in touched_paths:
+            if not isinstance(item, (str, Path)):
+                raise ValueError(f"Invalid touched path: {item!r}")
+            s = str(item).strip()
+            if not s or not s.isprintable():
+                raise ValueError(f"Invalid touched path: {item!r}")
+            normalized.append(s.replace("\\", "/"))
+        return tuple(normalized)
+
+    def _matches_intentional_friction(self, task: Dict[str, Any], touched_paths: Sequence[str]) -> bool:
+        """Return True if task tags or touched_paths match configured intentional friction rules."""
+        cfg = self._load_rig_config()
+        hf_tags: frozenset[str] = cfg["high_friction_tags"]
+        if hf_tags:
+            task_tags = {t.strip().lower() for t in (task.get("tags") or "").split(",") if t.strip()}
+            if task_tags & hf_tags:
+                return True
+
+        hf_globs: Tuple[str, ...] = cfg["high_friction_globs"]
+        if hf_globs and touched_paths:
+            for tp in touched_paths:
+                for pat in hf_globs:
+                    if _match_segment_glob(tp, pat):
+                        return True
+        return False
 
     def init_rig(self, scaffold_icm: bool = True) -> Optional[str]:
         """Initialize directory layout, SQLite databases with WAL pragmas, and ICM scaffolding."""
@@ -566,6 +708,7 @@ Add task details and acceptance criteria here.
         task_id: str,
         agent: str,
         ttl_seconds: int = 1800,
+        ignore_backpressure: bool = False,
     ) -> bool:
         """Atomic Compare-And-Swap task lease claiming.
 
@@ -573,8 +716,11 @@ Add task details and acceptance criteria here.
         1. Task status is 'todo' or 'working'.
         2. Task is either unclaimed, expired, or already claimed by the same agent.
         3. The version in the DB matches the in-memory read version.
+        4. Review-queue backpressure permits the claim (when configured).
         """
         self._validate_task_id(task_id)
+        if not isinstance(ignore_backpressure, bool):
+            raise ValueError("ignore_backpressure must be a bool")
         if not isinstance(agent, str) or not agent.strip() or not agent.replace("\r", " ").replace("\n", " ").isprintable():
             raise ValueError("agent must be a non-empty string")
         try:
@@ -593,6 +739,16 @@ Add task details and acceptance criteria here.
         status = task.get("status")
         if status not in ("todo", "working"):
             return False
+
+        rig_cfg = self._load_rig_config()
+        max_pending_review = rig_cfg["max_pending_review"]
+        archetype = (task.get("archetype") or "diff_synthesizer").strip().lower()
+        apply_backpressure = (
+            status == "todo"
+            and max_pending_review is not None
+            and archetype not in VERIFY_ONLY_ARCHETYPES
+            and not ignore_backpressure
+        )
 
         now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         lease_until_str = lease_until_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -613,10 +769,16 @@ Add task details and acceptance criteria here.
         if not can_claim:
             return False
 
+        backpressure_clause = ""
+        update_params: List[Any] = [agent, lease_until_str, now_str, task_id, version, agent, now_str]
+        if apply_backpressure:
+            backpressure_clause = "AND (status = 'working' OR (SELECT COUNT(*) FROM tasks WHERE status = 'review') < ?)"
+            update_params.append(max_pending_review)
+
         with self.get_queue_conn() as conn:
             cur = conn.cursor()
             cur.execute(
-                """
+                f"""
                 UPDATE tasks
                 SET claimed_by = ?,
                     lease_until = ?,
@@ -632,8 +794,9 @@ Add task details and acceptance criteria here.
                       OR lease_until < ?
                       OR (status = 'todo' AND claimed_by IS NULL)
                   )
+                  {backpressure_clause}
                 """,
-                (agent, lease_until_str, now_str, task_id, version, agent, now_str),
+                tuple(update_params),
             )
             success = cur.rowcount == 1
             if success:
@@ -772,8 +935,10 @@ Add task details and acceptance criteria here.
         allow_self_approval: bool = False,
         session_id: Optional[str] = None,
         evidence_paths: Optional[Sequence[str | Path]] = None,
+        touched_paths: Optional[Sequence[str | Path]] = None,
+        model_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        """Mark task as done enforcing anti-self-approval when required."""
+        """Mark task as done enforcing anti-self-approval and intentional friction when required."""
         self._validate_task_id(task_id)
         if not isinstance(allow_self_approval, bool):
             raise ValueError("allow_self_approval must be a bool")
@@ -787,6 +952,8 @@ Add task details and acceptance criteria here.
                 raise ValueError("verifier must be printable")
         if session_id is not None and (not isinstance(session_id, str) or not session_id.strip() or not session_id.isprintable()):
             raise ValueError("session_id must be a non-empty printable string")
+        resolved_model = resolve_model_id(model_id)
+        norm_touched = self._validate_touched_paths(touched_paths)
         self._ensure_queue_ready()
         self._ensure_audit_ready()
         task = self.get_task(task_id)
@@ -819,6 +986,12 @@ Add task details and acceptance criteria here.
             return False, f"Cannot complete task '{task_id}': lease expired at {task.get('lease_until')}"
 
         implementer = task.get("claimed_by") or agent
+        friction_triggered = self._matches_intentional_friction(task, norm_touched)
+
+        if friction_triggered and allow_self_approval:
+            raise PermissionError(
+                f"Self-approval forbidden by intentional friction gate on task '{task_id}'."
+            )
 
         # Anti-self-approval rule
         if not allow_self_approval:
@@ -832,6 +1005,10 @@ Add task details and acceptance criteria here.
         evidence_records: List[Dict[str, Any]] = []
         if evidence_paths is not None:
             evidence_records = self._validate_and_hash_evidence(evidence_paths)
+        if friction_triggered and not evidence_records:
+            raise ValueError(
+                f"Intentional friction gate requires non-empty SHA-256 evidence on task '{task_id}'."
+            )
 
         seat = derive_seat(agent)
         event_payload: Dict[str, Any] = {
@@ -840,6 +1017,8 @@ Add task details and acceptance criteria here.
             "seat": seat,
             "session_id": session_id,
         }
+        if resolved_model is not None:
+            event_payload["model_id"] = resolved_model
         if evidence_records:
             event_payload["evidence"] = evidence_records
         version = task.get("version", 0)
@@ -887,6 +1066,259 @@ Add task details and acceptance criteria here.
         )
         self.sync_board()
         return True, "Task completed successfully"
+
+    def submit_for_review(
+        self,
+        task_id: str,
+        agent: str,
+        summary: str,
+        verification_cmd: Optional[str] = None,
+        diffstat: Optional[str] = None,
+        evidence_paths: Optional[Sequence[str | Path]] = None,
+        session_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Transition a working task to review with verification receipt and SHA-256 evidence."""
+        self._validate_task_id(task_id)
+        if not isinstance(agent, str) or not agent.strip() or not agent.replace("\r", " ").replace("\n", " ").isprintable():
+            raise ValueError("agent must be a non-empty printable string")
+        if not isinstance(summary, str) or not summary.strip() or not summary.replace("\t", " ").replace("\n", " ").replace("\r", " ").isprintable():
+            raise ValueError("summary must be a non-empty printable string")
+        if verification_cmd is not None:
+            if not isinstance(verification_cmd, str) or not verification_cmd.strip() or not verification_cmd.replace("\t", " ").replace("\n", " ").replace("\r", " ").isprintable():
+                raise ValueError("verification_cmd must be a non-empty printable string")
+            verification_cmd = verification_cmd.strip()
+        if diffstat is not None:
+            if not isinstance(diffstat, str) or not diffstat.strip() or not diffstat.replace("\t", " ").replace("\n", " ").replace("\r", " ").isprintable():
+                raise ValueError("diffstat must be a non-empty printable string")
+            diffstat = diffstat.strip()
+        if session_id is not None and (not isinstance(session_id, str) or not session_id.strip() or not session_id.isprintable()):
+            raise ValueError("session_id must be a non-empty printable string")
+        resolved_model = resolve_model_id(model_id)
+
+        self._ensure_queue_ready()
+        self._ensure_audit_ready()
+        task = self.get_task(task_id)
+        if not task:
+            return False, f"Task {task_id} not found"
+
+        now = utc_now_iso()
+        if task["status"] != "working":
+            return False, f"Cannot submit task '{task_id}' for review: status is '{task['status']}' (must be 'working')"
+        if task.get("claimed_by") != agent:
+            return False, f"Cannot submit task '{task_id}' for review: claimed by '{task.get('claimed_by')}', not '{agent}'"
+        if task.get("lease_until") is not None and task.get("lease_until") < now:
+            return False, f"Cannot submit task '{task_id}' for review: lease expired at {task.get('lease_until')}"
+
+        evidence_records: List[Dict[str, Any]] = []
+        if evidence_paths is not None:
+            evidence_records = self._validate_and_hash_evidence(evidence_paths)
+
+        event_payload: Dict[str, Any] = {
+            "summary": summary.strip(),
+            "implementer": task.get("claimed_by") or agent,
+            "seat": derive_seat(agent),
+            "session_id": session_id,
+        }
+        if resolved_model is not None:
+            event_payload["model_id"] = resolved_model
+        if verification_cmd is not None:
+            event_payload["verification_cmd"] = verification_cmd
+        if diffstat is not None:
+            event_payload["diffstat"] = diffstat
+        if evidence_records:
+            event_payload["evidence"] = evidence_records
+
+        version = task.get("version", 0)
+        with self.get_queue_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE tasks
+                SET status = 'review',
+                    lease_until = NULL,
+                    version = version + 1,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'working'
+                  AND claimed_by = ?
+                  AND version = ?
+                  AND (lease_until IS NULL OR lease_until >= ?)
+                """,
+                (now, task_id, agent, version, now),
+            )
+            if cur.rowcount != 1:
+                return False, f"Concurrent modification detected or lease lost on task '{task_id}' (expected version {version})"
+
+            conn.execute(
+                """
+                INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
+                VALUES (?, 'review_submitted', ?, ?, ?)
+                """,
+                (task_id, agent, json.dumps(event_payload), now),
+            )
+            conn.commit()
+
+        self.log_audit(
+            task_id=task_id,
+            action="task_review_submitted",
+            agent=agent.replace("\r", " ").replace("\n", " "),
+            verification_status="pending_review",
+            payload=json.dumps(event_payload),
+        )
+        self.sync_board()
+        return True, "Task submitted for review"
+
+    def approve_review(
+        self,
+        task_id: str,
+        verifier: str,
+        session_id: Optional[str] = None,
+        evidence_paths: Optional[Sequence[str | Path]] = None,
+        touched_paths: Optional[Sequence[str | Path]] = None,
+        model_id: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Approve a task in review and transition it to done with independent verifier enforcement."""
+        self._validate_task_id(task_id)
+        if not isinstance(verifier, str) or not verifier.strip() or not verifier.replace("\r", " ").replace("\n", " ").isprintable():
+            raise ValueError("verifier must be a non-empty printable string")
+        verifier = verifier.strip()
+        if session_id is not None and (not isinstance(session_id, str) or not session_id.strip() or not session_id.isprintable()):
+            raise ValueError("session_id must be a non-empty printable string")
+        resolved_model = resolve_model_id(model_id)
+        norm_touched = self._validate_touched_paths(touched_paths)
+
+        self._ensure_queue_ready()
+        self._ensure_audit_ready()
+        task = self.get_task(task_id)
+        if not task:
+            return False, f"Task {task_id} not found"
+
+        if task["status"] == "done":
+            return True, f"Task {task_id} already completed"
+
+        with self.get_queue_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, status FROM tasks WHERE parent_id = ? AND status NOT IN ('done', 'cancelled', 'canceled', 'archived')",
+                (task_id,),
+            )
+            open_children = [dict(r) for r in cur.fetchall()]
+        if open_children:
+            child_ids = ", ".join(r["id"] for r in open_children)
+            return False, f"Cannot complete {task_id}: open child tasks remain ({child_ids})"
+
+        if task["status"] != "review":
+            return False, f"Cannot approve task '{task_id}': status is '{task['status']}' (must be 'review')"
+
+        implementers: set[str] = set()
+        if task.get("claimed_by"):
+            implementers.add(str(task["claimed_by"]))
+        latest_review_evidence: List[Dict[str, Any]] = []
+        latest_implementer: Optional[str] = task.get("claimed_by")
+
+        with self.get_queue_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT event_type, agent, payload FROM task_events WHERE task_id = ? ORDER BY id DESC",
+                (task_id,),
+            )
+            for row in cur.fetchall():
+                ev_type = row["event_type"]
+                if ev_type == "blocked":
+                    break
+                if ev_type in ("claimed", "review_submitted"):
+                    if row["agent"]:
+                        implementers.add(str(row["agent"]))
+                    raw_payload = row["payload"]
+                    if raw_payload:
+                        try:
+                            parsed = json.loads(raw_payload)
+                        except json.JSONDecodeError:
+                            parsed = None
+                        if isinstance(parsed, dict):
+                            if parsed.get("implementer"):
+                                implementers.add(str(parsed["implementer"]))
+                                if latest_implementer is None:
+                                    latest_implementer = str(parsed["implementer"])
+                            if ev_type == "review_submitted" and not latest_review_evidence:
+                                ev_list = parsed.get("evidence")
+                                if isinstance(ev_list, list):
+                                    valid_ev = [
+                                        item for item in ev_list
+                                        if isinstance(item, dict)
+                                        and isinstance(item.get("path"), str)
+                                        and isinstance(item.get("sha256"), str)
+                                        and SHA256_HEX_PATTERN.fullmatch(item["sha256"])
+                                    ]
+                                    if valid_ev:
+                                        latest_review_evidence = valid_ev
+
+        for imp in sorted(implementers):
+            if _is_self_approval(imp, verifier):
+                raise PermissionError(
+                    f"Self-approval forbidden: verifier '{verifier}' matches pre-review implementer '{imp}'."
+                )
+
+        if evidence_paths is not None:
+            evidence_records = self._validate_and_hash_evidence(evidence_paths)
+        else:
+            evidence_records = latest_review_evidence
+
+        if self._matches_intentional_friction(task, norm_touched) and not evidence_records:
+            raise ValueError(
+                f"Intentional friction gate requires non-empty SHA-256 evidence on task '{task_id}'."
+            )
+
+        now = utc_now_iso()
+        version = task.get("version", 0)
+        event_payload: Dict[str, Any] = {
+            "verifier": verifier,
+            "implementer": latest_implementer or verifier,
+            "seat": derive_seat(verifier),
+            "session_id": session_id,
+        }
+        if resolved_model is not None:
+            event_payload["model_id"] = resolved_model
+        if evidence_records:
+            event_payload["evidence"] = evidence_records
+
+        with self.get_queue_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE tasks
+                SET status = 'done',
+                    lease_until = NULL,
+                    version = version + 1,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'review'
+                  AND version = ?
+                """,
+                (now, task_id, version),
+            )
+            if cur.rowcount != 1:
+                return False, f"Concurrent modification detected on task '{task_id}' (expected version {version})"
+
+            conn.execute(
+                """
+                INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
+                VALUES (?, 'completed', ?, ?, ?)
+                """,
+                (task_id, verifier, json.dumps(event_payload), now),
+            )
+            conn.commit()
+
+        self.log_audit(
+            task_id=task_id,
+            action="task_completed",
+            agent=verifier.replace("\r", " ").replace("\n", " "),
+            verification_status="verified",
+            payload=json.dumps(event_payload),
+        )
+        self.sync_board()
+        return True, "Task review approved and completed"
 
     def get_next_workflow_step(self, task_id: str) -> Dict[str, Any]:
         """Compute next workflow step under parent task or epic enforcing workflow rails."""
@@ -1315,6 +1747,8 @@ Add task details and acceptance criteria here.
             ("blocked", "Blocked / Human Hold"),
             ("done", "Completed"),
         ]
+        if sections.get("review"):
+            status_display.insert(1, ("review", "Pending Review / Verification"))
         if sections.get("cancelled"):
             status_display.append(("cancelled", "Cancelled / Archived"))
 
