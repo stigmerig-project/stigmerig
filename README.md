@@ -242,6 +242,32 @@ stigmerig task fail --id TASK-001 --agent AgentAlpha --reason "SQLite lock timeo
 Repeated failures matching the same normalized signature increment `occurrences` instead of creating duplicate entries.
 When `occurrences` reaches `>= 3`, StigmeRig sets `promotion_candidate` to `true` and surfaces the trap in telemetry reports.
 
+### Deterministic Trap Ratchet (`stigmerig traps`)
+
+`stigmerig traps` turns recurring blockers and anti-patterns into enforced static regex checks across 30+ polyglot file extensions.
+All trap commands run standalone in CI or developer checkouts without requiring an initialized `queue.db`.
+
+Seed opt-in starter packs (`generic`, `python`, `typescript`, `rust`, `go`, or `all`) when native linters are absent:
+
+```bash
+stigmerig traps seed --pack all
+stigmerig traps verify
+stigmerig traps scan . --json
+```
+
+Starter pack remediations cross-reference native linter rules (`ruff S110`, `@typescript-eslint/ban-ts-comment`, `clippy`, and `errcheck`).
+Promote harvested blocker candidates in-place by attaching a regex pattern, positive and negative fixtures, and prescriptive remediation (`>= 20` characters):
+
+```bash
+stigmerig traps promote --id TRAP-001 \
+  --pattern '\bsqlite3\.connect\([^)]*\)' \
+  --positive-fixture 'conn = sqlite3.connect(db_path)' \
+  --negative-fixture 'conn = sqlite3.connect(db_path, timeout=5.0)' \
+  --remediation 'Pass an explicit timeout parameter to sqlite3.connect() to prevent SQLITE_BUSY lock failures.'
+```
+
+Promotion preserves `source_traces` and `occurrences` while locking `traps.json` across concurrent processes.
+
 ## CLI and Environment Reference
 
 Pass `--rig-dir <path>` before any subcommand to target an isolated `.stigmerig` state directory.
@@ -260,6 +286,7 @@ Pass `--rig-dir <path>` before any subcommand to target an isolated `.stigmerig`
 | `stigmerig board sync` | Regenerate `<rig_dir>/Task_Board.md` from `queue.db`. | None |
 | `stigmerig telemetry sequence` | Emit a Mermaid sequence diagram of recorded agent handoffs. | `--task <id>`, `--output <file>` |
 | `stigmerig telemetry metrics` | Export task durations, Anti-DMV ratios, wave shapes, and recurring traps. | `--json`, `--output <file>` |
+| `stigmerig traps` | Seed, register, promote, dismiss, verify, and scan polyglot trap invariants. | `scan`, `verify`, `seed`, `register`, `promote`, `dismiss`, `--registry`, `--json` |
 
 Environment variables configure default runtime resolution:
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from stigmerig.db import TASK_ID_PATTERN, StigmeRigDB, _atomic_write_text, _is_self_approval, resolve_rig_dir
+from stigmerig.traps import add_traps_parser, run_traps_command, validate_traps_cli_args
 
 VALID_TASK_STATUSES = frozenset({"todo", "working", "done", "blocked", "cancelled", "canceled", "archived"})
 
@@ -38,7 +39,7 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
                 s_item = str(os.fspath(item))
                 if "\x00" in s_item:
                     raise ValueError(f"--{name.replace('_', '-')} must not contain embedded NUL bytes")
-                if name not in ("id", "task", "parent") and _has_ctrl(s_item, allow_ws=name in ("title", "reason", "payload")):
+                if name not in ("id", "task", "parent") and _has_ctrl(s_item, allow_ws=name in ("title", "reason", "payload", "positive_fixture", "negative_fixture", "remediation", "forbidden")):
                     raise ValueError(f"--{name.replace('_', '-')} must not contain control or non-printable Unicode characters")
     dir_checks = [(f"--{f.replace('_', '-')}", getattr(args, f, None)) for f in ("rig_dir", "path")]
     env_root = os.environ.get("STIGMERIG_ROOT") if dir_checks[0][1] is None and dir_checks[1][1] is None else None
@@ -129,6 +130,8 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
             raise ValueError("Duplicate --evidence paths resolving to the same target are not allowed")
     if getattr(args, "output", None) is not None:
         _write_output(args.output, None, res_dir)
+    if cmd == "traps":
+        validate_traps_cli_args(args, res_dir)
 
 
 def _write_output(raw_path: str | os.PathLike[str], content: Optional[str] = None, rig_dir: Optional[Path | str] = None) -> None:
@@ -356,6 +359,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_wprune.add_argument("--dry-run", action="store_true", help="Preview prunable worktrees and branches without deleting")
     p_wprune.add_argument("--output", default=None, help="Output file path for JSON prune report")
 
+    add_traps_parser(subparsers)
     return parser
 
 
@@ -389,6 +393,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if hint:
                 print(hint)
             return 0
+
+        if args.command == "traps":
+            return run_traps_command(args, rig.rig_dir)
 
         if args.command == "worktree":
             from stigmerig.wave import get_git_repo_root

@@ -1,0 +1,90 @@
+{
+  "version": "1.0.0",
+  "traps": [
+    {
+      "trap_id": "TRAP-GEN-001",
+      "domain": "vcs-hygiene",
+      "title": "Unresolved Git Merge Conflict Marker",
+      "trigger_pattern": "^(?:<{7}|>{7}|\\|{7})\\s+\\S+",
+      "forbidden_claim_or_action": "Leaving unresolved git merge conflict markers in source, configuration, or documentation files.",
+      "remediation_atom": "Resolve all merge conflict branches completely and run git diff --check before committing.",
+      "source_trace": "stigmerig:starter-pack:generic",
+      "source_traces": [
+        "stigmerig:starter-pack:generic"
+      ],
+      "occurrences": 1,
+      "status": "promoted",
+      "target_globs": [
+        "**",
+        "!tests/**",
+        "!**/tests/**"
+      ],
+      "fixtures": {
+        "positive": "<<<<<<< HEAD\nconst port = 8080;\n=======\nconst port = 9090;\n>>>>>>> main",
+        "negative": "Summary\n=======\nconst port = 8080;"
+      },
+      "promoted_at": "2026-11-16"
+    },
+    {
+      "trap_id": "TRAP-PY-001",
+      "domain": "python-hygiene",
+      "title": "Silent Broad Exception Pass",
+      "trigger_pattern": "^([ \\t]*)except\\s+(?:Exception|BaseException)(?:\\s+as\\s+[A-Za-z_]\\w*)?\\s*:(?:[ \\t]*pass\\b|[ \\t]*(?:#[^\\r\\n]*)?\\r?\\n\\1[ \\t]+pass\\b)",
+      "forbidden_claim_or_action": "Swallowing broad Exception or BaseException blocks with a silent pass statement.",
+      "remediation_atom": "Catch narrow exception tuples (such as OSError or ValueError) and handle or log failures explicitly per ruff S110.",
+      "source_trace": "stigmerig:starter-pack:python",
+      "source_traces": [
+        "stigmerig:starter-pack:python"
+      ],
+      "occurrences": 1,
+      "status": "promoted",
+      "target_globs": [
+        "**/*.py",
+        "**/*.pyi",
+        "!tests/**",
+        "!**/tests/**",
+        "!**/__tests__/**",
+        "!**/test_*.py",
+        "!**/*_test.*",
+        "!**/*.test.*",
+        "!**/*.spec.*"
+      ],
+      "fixtures": {
+        "positive": "def read_cfg():\n    try:\n        return load()\n    except Exception:\n        pass",
+        "negative": "def read_cfg():\n    try:\n        return load()\n    except (OSError, ValueError) as exc:\n        logger.warning('cfg error: %s', exc)"
+      },
+      "match_mode": "multiline",
+      "promoted_at": "2026-11-16"
+    },
+    {
+      "trap_id": "TRAP-PY-002",
+      "domain": "python-hygiene",
+      "title": "Unscoped Type Ignore Comment",
+      "trigger_pattern": "#\\s*type:\\s*ignore(?!\\s*\\x5b[A-Za-z0-9_,\\s-]+\\x5d)",
+      "forbidden_claim_or_action": "Using bare # type: ignore comments without scoping the specific error code in brackets.",
+      "remediation_atom": "Resolve the static type mismatch or scope the suppression to an explicit code like # type: ignore[attr-defined] per mypy ignore-without-code and ruff PGH003.",
+      "source_trace": "stigmerig:starter-pack:python",
+      "source_traces": [
+        "stigmerig:starter-pack:python"
+      ],
+      "occurrences": 1,
+      "status": "promoted",
+      "target_globs": [
+        "**/*.py",
+        "**/*.pyi",
+        "!tests/**",
+        "!**/tests/**",
+        "!**/__tests__/**",
+        "!**/test_*.py",
+        "!**/*_test.*",
+        "!**/*.test.*",
+        "!**/*.spec.*"
+      ],
+      "fixtures": {
+        "positive": "result = dynamic_dispatch(payload)  # type: ignore",
+        "negative": "result = dynamic_dispatch(payload)  # type: ignore[no-any-return]"
+      },
+      "promoted_at": "2026-11-16"
+    }
+  ]
+}

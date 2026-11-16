@@ -17,6 +17,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from stigmerig.traps import trap_file_lock
+
 
 GENESIS_HASH: str = "0" * 64
 SHA256_HEX_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -81,12 +83,13 @@ This document defines autonomous agent coordination standards and stigmergic inv
 2. **Worktree Isolation**: Implementers isolate execution branches in dedicated git worktrees.
 3. **Anti-Self-Approval**: Verification must be performed by an independent verifier before completing tasks.
 4. **Append-Only WORM Audit**: All state transitions and completion records are hash-chained in the audit ledger.
+5. **Deterministic Trap Ratchet**: Run `stigmerig traps scan` across polyglot source files and bind verification outputs via `--evidence`.
 
 ## Workflow
 
 1. Query available tasks via `stigmerig task list --status todo`.
 2. Claim a task with lease TTL via `stigmerig task claim --id <id> --agent <agent>`.
-3. Complete implementation and submit for verification via `stigmerig task done --id <id> --agent <agent> --verifier <verifier>`.
+3. Scan traps via `stigmerig traps scan` and complete verification via `stigmerig task done --id <id> --agent <agent> --verifier <verifier> --evidence <path>`.
 """
 
 DEFAULT_CONTEXT_TEMPLATE = """# Project Context
@@ -1058,69 +1061,70 @@ Add task details and acceptance criteria here.
         now = utc_now_iso()
         trace_entry = f"Task {task_id} ({agent})"
 
-        doc: Dict[str, Any] = {"version": "1.0.0", "traps": []}
-        if traps_path.exists():
-            try:
-                loaded = json.loads(traps_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict) and isinstance(loaded.get("traps"), list):
-                    doc = loaded
-                    doc.setdefault("version", "1.0.0")
-            except (OSError, ValueError):
-                doc = {"version": "1.0.0", "traps": []}
+        with trap_file_lock(traps_path):
+            doc: Dict[str, Any] = {"version": "1.0.0", "traps": []}
+            if traps_path.exists():
+                try:
+                    loaded = json.loads(traps_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict) and isinstance(loaded.get("traps"), list):
+                        doc = loaded
+                        doc.setdefault("version", "1.0.0")
+                except (OSError, ValueError):
+                    doc = {"version": "1.0.0", "traps": []}
 
-        traps: List[Dict[str, Any]] = doc["traps"]
-        matched: Optional[Dict[str, Any]] = None
-        norm_title = clean_reason.lower()
+            traps: List[Dict[str, Any]] = doc["traps"]
+            matched: Optional[Dict[str, Any]] = None
+            norm_title = clean_reason.lower()
 
-        for entry in traps:
-            if not isinstance(entry, dict):
-                continue
-            if str(entry.get("status") or "").strip().lower() == "dismissed":
-                continue
-            existing_pattern = str(entry.get("trigger_pattern") or "").strip().lower()
-            existing_title = str(entry.get("title") or entry.get("reason") or "").strip().lower()
-            if (
-                (trigger_pattern and existing_pattern == trigger_pattern)
-                or existing_title == norm_title
-                or (trigger_pattern and _normalize_blocker_signature(existing_title) == trigger_pattern)
-            ):
-                matched = entry
-                break
-
-        if matched is not None:
-            raw_occ, raw_traces = matched.get("occurrences"), matched.get("source_traces")
-            occurrences = (int(raw_occ) if not isinstance(raw_occ, bool) and (isinstance(raw_occ, int) or (isinstance(raw_occ, float) and math.isfinite(raw_occ))) and raw_occ >= 0 else 0) + 1
-            matched["occurrences"] = occurrences
-            matched["last_seen_at"] = now
-            traces = [str(x) for x in raw_traces] if isinstance(raw_traces, list) else []
-            traces.append(trace_entry)
-            matched["source_traces"] = traces[-10:]
-            matched["promotion_candidate"] = occurrences >= 3
-            result = matched
-        else:
-            max_num = 0
             for entry in traps:
-                if isinstance(entry, dict):
-                    m = re.match(r"^TRAP-(\d+)$", str(entry.get("id") or ""))
-                    if m:
-                        max_num = max(max_num, int(m.group(1)))
-            trap_id = f"TRAP-{max(max_num, len(traps)) + 1:03d}"
-            result = {
-                "id": trap_id,
-                "title": clean_reason[:120],
-                "reason": clean_reason,
-                "trigger_pattern": trigger_pattern,
-                "status": "candidate",
-                "occurrences": 1,
-                "promotion_candidate": False,
-                "first_seen_at": now,
-                "last_seen_at": now,
-                "source_traces": [trace_entry],
-            }
-            traps.append(result)
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("status") or "").strip().lower() == "dismissed":
+                    continue
+                existing_pattern = str(entry.get("trigger_pattern") or "").strip().lower()
+                existing_title = str(entry.get("title") or entry.get("reason") or "").strip().lower()
+                if (
+                    (trigger_pattern and existing_pattern == trigger_pattern)
+                    or existing_title == norm_title
+                    or (trigger_pattern and _normalize_blocker_signature(existing_title) == trigger_pattern)
+                ):
+                    matched = entry
+                    break
 
-        _atomic_write_text(traps_path, json.dumps(doc, indent=2) + "\n")
-        return result
+            if matched is not None:
+                raw_occ, raw_traces = matched.get("occurrences"), matched.get("source_traces")
+                occurrences = (int(raw_occ) if not isinstance(raw_occ, bool) and (isinstance(raw_occ, int) or (isinstance(raw_occ, float) and math.isfinite(raw_occ))) and raw_occ >= 0 else 0) + 1
+                matched["occurrences"] = occurrences
+                matched["last_seen_at"] = now
+                traces = [str(x) for x in raw_traces] if isinstance(raw_traces, list) else []
+                traces.append(trace_entry)
+                matched["source_traces"] = traces[-10:]
+                matched["promotion_candidate"] = occurrences >= 3
+                result = matched
+            else:
+                max_num = 0
+                for entry in traps:
+                    if isinstance(entry, dict):
+                        m = re.match(r"^TRAP-(\d+)$", str(entry.get("id") or entry.get("trap_id") or ""))
+                        if m:
+                            max_num = max(max_num, int(m.group(1)))
+                trap_id = f"TRAP-{max(max_num, len(traps)) + 1:03d}"
+                result = {
+                    "id": trap_id,
+                    "title": clean_reason[:120],
+                    "reason": clean_reason,
+                    "trigger_pattern": trigger_pattern,
+                    "status": "candidate",
+                    "occurrences": 1,
+                    "promotion_candidate": False,
+                    "first_seen_at": now,
+                    "last_seen_at": now,
+                    "source_traces": [trace_entry],
+                }
+                traps.append(result)
+
+            _atomic_write_text(traps_path, json.dumps(doc, indent=2) + "\n")
+            return result
 
     def log_audit(
         self,
