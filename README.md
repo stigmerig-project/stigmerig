@@ -14,7 +14,7 @@ It coordinates autonomous coding agents through environmental stigmergy without 
 StigmeRig synthesizes foundational concepts across biology, distributed systems, and agent architecture:
 
 - **Pierre-Paul Grasse (1959)**: Formulated biological stigmergy, showing how decentralized social insects coordinate indirectly through environmental modifications.
-- **Nate B Jones (`OpenRig`)**: Pioneered sovereign local-first AI architectures, deterministic agent rails, and strict execution-verification separation.
+- **Nate B Jones**: Pioneered sovereign local-first AI architectures, deterministic agent rails, and strict execution-verification separation.
 - **Jake Van Clief (`Interpretable Context Model - ICM`)**: Formulated file-over-app execution boundaries, tiered context pruning, and automated orientation scaffolding (`AGENTS.md` and `CONTEXT.md`).
 - **Mike (`@FeralMachine`) (`OpenRig`)**: Architected multi-agent civilization topologies, persistent rigs, and progressive disclosure context engineering.
 - **Marcus Schwarz (`@mvschwarz`)**: Developed early file-based and SQLite task queues for local agent developer swarms.
