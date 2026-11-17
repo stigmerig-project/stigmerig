@@ -46,7 +46,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(content)
         os.replace(tmp_name, path)
     except BaseException:
@@ -80,11 +80,7 @@ def _normalize_blocker_signature(reason: str) -> str:
         keywords = list(dict.fromkeys(t for t in raw_tokens if len(t) >= 2))
     return " ".join(keywords) if keywords else clean
 
-DEFAULT_AGENTS_TEMPLATE = """# AGENTS
-
-This document defines autonomous agent coordination standards and stigmergic invariants.
-
-## Autonomous Operation Invariants
+_AGENTS_MANAGED_BODY = """## Autonomous Operation Invariants
 
 1. **Local-First Stigmergy**: Agents coordinate indirectly through `.stigmerig` task state and filesystem artifacts.
 2. **Worktree Isolation**: Implementers isolate execution branches in dedicated git worktrees.
@@ -96,8 +92,120 @@ This document defines autonomous agent coordination standards and stigmergic inv
 
 1. Query available tasks via `stigmerig task list --status todo`.
 2. Claim a task with lease TTL via `stigmerig task claim --id <id> --agent <agent>`.
-3. Scan traps via `stigmerig traps scan` and complete verification via `stigmerig task done --id <id> --agent <agent> --verifier <verifier> --evidence <path>`.
-"""
+3. Scan traps via `stigmerig traps scan` and complete verification via `stigmerig task done --id <id> --agent <agent> --verifier <verifier> --evidence <path>`."""
+
+
+def _compute_icm_sha256(body: str) -> str:
+    """Compute canonical 16-hex-char SHA-256 digest of LF-normalized ICM directive text."""
+    normalized = body.replace("\r\n", "\n").strip("\n")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+CANONICAL_AGENTS_SHA256: str = _compute_icm_sha256(_AGENTS_MANAGED_BODY)
+_ICM_BEGIN_MARKER_RE: re.Pattern[str] = re.compile(
+    r"^[ \t]*<!--\s*stigmerig:begin\s+sha256=([0-9a-fA-F]{16})\s*-->[ \t]*$"
+)
+_ICM_END_MARKER_RE: re.Pattern[str] = re.compile(
+    r"^[ \t]*<!--\s*stigmerig:end\s*-->[ \t]*$"
+)
+_ICM_MARKER_PREFIX_RE: re.Pattern[str] = re.compile(r"^[ \t]*<!--\s*stigmerig:")
+_LINE_SPLIT_RE: re.Pattern[str] = re.compile(r"([^\r\n]*)(\r\n|\r|\n|$)")
+
+
+def _render_icm_block(newline: str = "\n") -> str:
+    """Render bounded managed AGENTS block using the given line ending."""
+    body = _AGENTS_MANAGED_BODY.replace("\n", newline)
+    return (
+        f"<!-- stigmerig:begin sha256={CANONICAL_AGENTS_SHA256} -->{newline}"
+        f"{body}{newline}"
+        f"<!-- stigmerig:end -->"
+    )
+
+
+def _split_lines_with_endings(text: str) -> List[Tuple[str, str]]:
+    """Split text into (line, eol) pairs without normalizing CRLF or LF."""
+    lines: List[Tuple[str, str]] = []
+    for match in _LINE_SPLIT_RE.finditer(text):
+        if match.start() == len(text):
+            break
+        lines.append((match.group(1), match.group(2)))
+    return lines
+
+
+def _parse_icm_markers(
+    text: str,
+) -> Optional[Tuple[List[Tuple[str, str]], int, int, str, str]]:
+    """Parse bounded stigmerig markers from raw text.
+
+    Returns None when zero line-anchored markers exist, otherwise returns
+    (lines, begin_idx, end_idx, header_sha256, actual_sha256).
+    Raises ValueError on malformed, duplicate, nested, reversed, or unclosed markers.
+    """
+    lines = _split_lines_with_endings(text)
+    begin_idx: Optional[int] = None
+    header_sha256: Optional[str] = None
+    end_idx: Optional[int] = None
+    closed = False
+
+    for idx, (line_body, _) in enumerate(lines):
+        begin_match = _ICM_BEGIN_MARKER_RE.match(line_body)
+        if begin_match:
+            if begin_idx is not None:
+                kind = "Duplicate" if closed else "Nested"
+                raise ValueError(f"{kind} stigmerig:begin marker at line {idx + 1}")
+            begin_idx = idx
+            header_sha256 = begin_match.group(1).lower()
+            continue
+
+        if _ICM_END_MARKER_RE.match(line_body):
+            if begin_idx is None:
+                raise ValueError(f"Reversed or orphan stigmerig:end marker at line {idx + 1}")
+            if closed:
+                raise ValueError(f"Duplicate stigmerig:end marker at line {idx + 1}")
+            end_idx = idx
+            closed = True
+            continue
+
+        if _ICM_MARKER_PREFIX_RE.match(line_body):
+            raise ValueError(f"Malformed stigmerig marker at line {idx + 1}")
+
+    if begin_idx is not None and not closed:
+        raise ValueError(f"Unclosed stigmerig:begin marker at line {begin_idx + 1}")
+
+    if begin_idx is None:
+        return None
+
+    assert end_idx is not None and header_sha256 is not None
+    inner = "".join(line + eol for line, eol in lines[begin_idx + 1 : end_idx])
+    actual_sha256 = _compute_icm_sha256(inner)
+    return lines, begin_idx, end_idx, header_sha256, actual_sha256
+
+
+def _detect_line_ending(
+    lines: Sequence[Tuple[str, str]], begin_idx: int, end_idx: int
+) -> str:
+    """Detect CRLF vs LF preference from outer prose lines, falling back to full file."""
+    outer_eols = [
+        eol for _, eol in (*lines[:begin_idx], *lines[end_idx:]) if eol in ("\r\n", "\n")
+    ]
+    sample = outer_eols or [eol for _, eol in lines if eol in ("\r\n", "\n")]
+    crlf_count = sample.count("\r\n")
+    lf_count = sample.count("\n")
+    return "\r\n" if crlf_count > 0 and crlf_count >= lf_count else "\n"
+
+
+def _replace_icm_block(
+    lines: Sequence[Tuple[str, str]], begin_idx: int, end_idx: int
+) -> str:
+    """Replace lines[begin_idx..end_idx] while preserving surrounding prose and EOLs."""
+    line_sep = _detect_line_ending(lines, begin_idx, end_idx)
+    prefix = "".join(line + eol for line, eol in lines[:begin_idx])
+    suffix = "".join(line + eol for line, eol in lines[end_idx + 1 :])
+    end_eol = lines[end_idx][1]
+    return f"{prefix}{_render_icm_block(line_sep)}{end_eol}{suffix}"
+
+
+DEFAULT_AGENTS_TEMPLATE = f"# AGENTS\n\n{_render_icm_block()}\n"
 
 DEFAULT_CONTEXT_TEMPLATE = """# Project Context
 
@@ -286,6 +394,17 @@ class StigmeRigDB:
         rig_dir: Optional[Path | str] = None,
         workspace_root: Optional[Path | str] = None,
     ):
+        raw_input = (
+            Path(rig_dir)
+            if rig_dir
+            else (
+                Path(env_root)
+                if (env_root := os.environ.get("STIGMERIG_ROOT"))
+                else Path.cwd() / ".stigmerig"
+            )
+        )
+        self._input_rig_dir: Path = raw_input
+        self._raw_rig_dir: Path = Path(os.path.abspath(str(raw_input)))
         self.rig_dir = resolve_rig_dir(rig_dir)
         self.workspace_root: Optional[Path] = (
             Path(workspace_root).resolve() if workspace_root else None
@@ -370,8 +489,51 @@ class StigmeRigDB:
                         return True
         return False
 
-    def init_rig(self, scaffold_icm: bool = True) -> Optional[str]:
+    def _validate_icm_paths(self, *, include_icm_files: bool = True) -> None:
+        """Reject symlinks and NTFS junctions on parent_dir, rig_dir, AGENTS.md, and sidecar."""
+        rig_candidates: List[Path] = [self.rig_dir]
+        for cand in (getattr(self, "_raw_rig_dir", None), getattr(self, "_input_rig_dir", None)):
+            if isinstance(cand, Path) and cand not in rig_candidates:
+                rig_candidates.append(cand)
+
+        parent_candidates: List[Path] = []
+        for rig_cand in rig_candidates:
+            parent_cand = rig_cand.parent
+            if parent_cand not in parent_candidates:
+                parent_candidates.append(parent_cand)
+
+        checks: List[Tuple[str, Path]] = [
+            *(("parent_dir", p) for p in parent_candidates),
+            *(("rig_dir", p) for p in rig_candidates),
+        ]
+        if include_icm_files:
+            checks.extend(("AGENTS.md", p / "AGENTS.md") for p in parent_candidates)
+            checks.extend(("AGENTS.stigmerig.md", p / "AGENTS.stigmerig.md") for p in rig_candidates)
+
+        for label, target in checks:
+            if _is_link_or_junction(target):
+                raise ValueError(f"Refusing symlink or junction for {label}: {target}")
+
+    @staticmethod
+    def _read_icm_text(path: Path) -> str:
+        """Read UTF-8 bytes from a regular ICM file without newline translation."""
+        if not path.is_file():
+            raise ValueError(f"Expected regular file for ICM target: {path}")
+        try:
+            return path.read_bytes().decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Invalid UTF-8 in {path}: {exc}") from exc
+
+    def init_rig(self, scaffold_icm: bool = True, sync_icm: bool = False) -> Optional[str]:
         """Initialize directory layout, SQLite databases with WAL pragmas, and ICM scaffolding."""
+        if sync_icm and not scaffold_icm:
+            raise ValueError("Cannot combine sync_icm=True with scaffold_icm=False")
+        self._validate_icm_paths(include_icm_files=scaffold_icm)
+        if scaffold_icm and sync_icm:
+            agents_file = self.rig_dir.parent / "AGENTS.md"
+            if agents_file.exists():
+                _parse_icm_markers(self._read_icm_text(agents_file))
+
         self.rig_dir.mkdir(parents=True, exist_ok=True)
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -480,33 +642,115 @@ class StigmeRigDB:
 
         hint: Optional[str] = None
         if scaffold_icm:
-            hint = self.scaffold_icm()
+            hint = self.scaffold_icm(sync_icm=sync_icm)
 
         return hint
 
-    def scaffold_icm(self) -> Optional[str]:
-        """Scaffold ICM files (AGENTS.md, CONTEXT.md, rig.json) without overwriting existing files."""
+    def scaffold_icm(self, sync_icm: bool = False) -> Optional[str]:
+        """Scaffold or synchronize ICM files (AGENTS.md, CONTEXT.md, rig.json)."""
+        self._validate_icm_paths(include_icm_files=True)
         parent_dir = self.rig_dir.parent
         rig_json = self.rig_dir / "rig.json"
+        if _is_link_or_junction(rig_json):
+            raise ValueError(f"Refusing symlink or junction for rig.json: {rig_json}")
         if not rig_json.exists():
-            rig_json.write_text(DEFAULT_RIG_JSON_TEMPLATE, encoding="utf-8")
+            _atomic_write_text(rig_json, DEFAULT_RIG_JSON_TEMPLATE)
 
         agents_file = parent_dir / "AGENTS.md"
         sidecar_file = self.rig_dir / "AGENTS.stigmerig.md"
         hint: Optional[str] = None
 
         if not agents_file.exists():
-            agents_file.write_text(DEFAULT_AGENTS_TEMPLATE, encoding="utf-8")
+            _atomic_write_text(agents_file, DEFAULT_AGENTS_TEMPLATE)
+        elif sync_icm:
+            raw_text = self._read_icm_text(agents_file)
+            parsed = _parse_icm_markers(raw_text)
+            if parsed is not None:
+                lines, begin_idx, end_idx, _, _ = parsed
+                updated_text = _replace_icm_block(lines, begin_idx, end_idx)
+                if updated_text != raw_text:
+                    _atomic_write_text(agents_file, updated_text)
+                hint = (
+                    f"Synchronized bounded ICM block in {agents_file.name} "
+                    f"(sha256={CANONICAL_AGENTS_SHA256})"
+                )
+            else:
+                _atomic_write_text(sidecar_file, DEFAULT_AGENTS_TEMPLATE)
+                hint = (
+                    f"AGENTS.md already exists without stigmerig markers; wrote sidecar instructions "
+                    f"to .stigmerig/{sidecar_file.name}. Embed the bounded block in AGENTS.md:\n"
+                    f"<!-- stigmerig:begin sha256={CANONICAL_AGENTS_SHA256} -->\n"
+                    f"<!-- stigmerig:end -->"
+                )
         else:
             if not sidecar_file.exists():
-                sidecar_file.write_text(DEFAULT_AGENTS_TEMPLATE, encoding="utf-8")
+                _atomic_write_text(sidecar_file, DEFAULT_AGENTS_TEMPLATE)
             hint = f"AGENTS.md already exists; wrote sidecar instructions to .stigmerig/{sidecar_file.name} (include it in your AGENTS.md)"
 
         context_file = parent_dir / "CONTEXT.md"
+        if _is_link_or_junction(context_file):
+            raise ValueError(f"Refusing symlink or junction for CONTEXT.md: {context_file}")
         if not context_file.exists():
-            context_file.write_text(DEFAULT_CONTEXT_TEMPLATE, encoding="utf-8")
+            _atomic_write_text(context_file, DEFAULT_CONTEXT_TEMPLATE)
 
         return hint
+
+    def check_icm(self) -> Tuple[bool, str]:
+        """Verify ICM directive digests read-only without creating files or databases."""
+        self._validate_icm_paths(include_icm_files=True)
+        agents_file = self.rig_dir.parent / "AGENTS.md"
+        sidecar_file = self.rig_dir / "AGENTS.stigmerig.md"
+
+        if agents_file.exists():
+            raw_agents = self._read_icm_text(agents_file)
+            parsed_agents = _parse_icm_markers(raw_agents)
+            if parsed_agents is not None:
+                _, _, _, header_sha, actual_sha = parsed_agents
+                if actual_sha == header_sha == CANONICAL_AGENTS_SHA256:
+                    return (
+                        True,
+                        f"ICM directives in {agents_file.name} match canonical sha256={CANONICAL_AGENTS_SHA256}",
+                    )
+                return (
+                    False,
+                    f"ICM directive drift in {agents_file.name} "
+                    f"(canonical={CANONICAL_AGENTS_SHA256}, header={header_sha}, actual={actual_sha}); "
+                    f"run 'stigmerig init --sync-icm'",
+                )
+
+        if not sidecar_file.exists():
+            if agents_file.exists():
+                return (
+                    False,
+                    f"{agents_file.name} contains no bounded stigmerig markers and "
+                    f".stigmerig/{sidecar_file.name} is missing; run 'stigmerig init --sync-icm'",
+                )
+            return (
+                False,
+                f"ICM directives missing ({agents_file.name} and .stigmerig/{sidecar_file.name} not found); "
+                f"run 'stigmerig init --sync-icm'",
+            )
+
+        raw_sidecar = self._read_icm_text(sidecar_file)
+        parsed_sidecar = _parse_icm_markers(raw_sidecar)
+        if parsed_sidecar is None:
+            return (
+                False,
+                f"Sidecar .stigmerig/{sidecar_file.name} contains no bounded stigmerig markers; "
+                f"run 'stigmerig init --sync-icm'",
+            )
+        _, _, _, header_sha, actual_sha = parsed_sidecar
+        if actual_sha == header_sha == CANONICAL_AGENTS_SHA256:
+            return (
+                True,
+                f"ICM directives in .stigmerig/{sidecar_file.name} match canonical sha256={CANONICAL_AGENTS_SHA256}",
+            )
+        return (
+            False,
+            f"ICM directive drift in .stigmerig/{sidecar_file.name} "
+            f"(canonical={CANONICAL_AGENTS_SHA256}, header={header_sha}, actual={actual_sha}); "
+            f"run 'stigmerig init --sync-icm'",
+        )
 
     @contextmanager
     def get_queue_conn(self):
@@ -934,6 +1178,236 @@ Add task details and acceptance criteria here.
             })
         return records
 
+    @staticmethod
+    def _format_follow_up_prefix(task_id: str) -> str:
+        """Build sanitized uppercase follow-up ID prefix truncated to stay within 64 chars."""
+        sanitized = re.sub(r"[^A-Z0-9._-]", "", task_id.upper())[:56]
+        if not sanitized:
+            sanitized = "TASK"
+        return f"FU-{sanitized}-"
+
+    @staticmethod
+    def _validate_follow_ups(
+        follow_ups: Optional[Sequence[str]],
+        follow_up_ids_out: Optional[List[str]],
+    ) -> Tuple[str, ...]:
+        """Validate optional follow-up titles and output list upfront."""
+        if follow_up_ids_out is not None and not isinstance(follow_up_ids_out, list):
+            raise ValueError("follow_up_ids_out must be a list when provided")
+        if follow_ups is None:
+            return ()
+        if isinstance(follow_ups, (str, bytes, bytearray, os.PathLike)) or not isinstance(follow_ups, (list, tuple)):
+            raise ValueError("follow_ups must be a list or tuple of strings")
+        if len(follow_ups) > 10:
+            raise ValueError("follow_ups supports at most 10 items per completion")
+        normalized: List[str] = []
+        for item in follow_ups:
+            if (
+                not isinstance(item, str)
+                or any(c in item for c in ("\r", "\n", "\t", "\x00"))
+                or not item.isprintable()
+            ):
+                raise ValueError("Each follow_up title must be a single-line printable string")
+            stripped = item.strip()
+            if not stripped or len(stripped) > 240:
+                raise ValueError("Each follow_up title must have stripped length between 1 and 240 characters")
+            normalized.append(stripped)
+        return tuple(normalized)
+
+    def _insert_follow_up_tasks(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        origin_task_id: str,
+        origin_parent_id: Optional[str],
+        fu_author: str,
+        follow_ups: Tuple[str, ...],
+        now: str,
+    ) -> List[Tuple[str, str, Path]]:
+        """Allocate sequential FU-<ORIGIN>-NNN IDs and insert follow-up rows inside an active write lock."""
+        prefix = self._format_follow_up_prefix(origin_task_id)
+        like_pattern = prefix.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+        suffix_re = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+
+        max_seq = 0
+        existing_upper: set[str] = set()
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE UPPER(id) LIKE ? ESCAPE '!'",
+            (like_pattern,),
+        ).fetchall()
+        for row in rows:
+            cand_upper = str(row["id"]).upper()
+            existing_upper.add(cand_upper)
+            match = suffix_re.fullmatch(cand_upper)
+            if match:
+                max_seq = max(max_seq, int(match.group(1)))
+
+        if self.tasks_dir.is_dir():
+            for entry in self.tasks_dir.iterdir():
+                name = entry.name
+                stem = (
+                    name[:-3]
+                    if name.lower().endswith(".md")
+                    else (name if (entry.is_dir() or _is_link_or_junction(entry)) else "")
+                )
+                if not stem:
+                    continue
+                cand_upper = stem.upper()
+                existing_upper.add(cand_upper)
+                match = suffix_re.fullmatch(cand_upper)
+                if match:
+                    max_seq = max(max_seq, int(match.group(1)))
+
+        tasks_root = self.tasks_dir.resolve()
+        rig_parent_root = self.rig_dir.parent.resolve()
+        created: List[Tuple[str, str, Path]] = []
+        seq = max_seq + 1
+        created_payload_base = {
+            "archetype": "diff_synthesizer",
+            "origin_task_id": origin_task_id,
+            "origin_parent_id": origin_parent_id,
+        }
+
+        for fu_title in follow_ups:
+            while f"{prefix}{seq:03d}".upper() in existing_upper:
+                seq += 1
+            fu_id = f"{prefix}{seq:03d}"
+            seq += 1
+            existing_upper.add(fu_id.upper())
+            self._validate_task_id(fu_id)
+            fu_file = self.get_task_file(fu_id)
+            if (
+                _is_link_or_junction(self.tasks_dir)
+                or _is_link_or_junction(fu_file)
+                or _is_link_or_junction(fu_file.parent)
+                or _is_link_or_junction(self.tasks_dir / fu_id)
+            ):
+                raise ValueError(f"Refusing symlink or junction for follow-up task file: {fu_file}")
+            resolved_file = fu_file.resolve()
+            if not resolved_file.is_relative_to(tasks_root):
+                raise ValueError(f"Task file traversal detected: '{fu_file}' escapes '{tasks_root}'")
+            context_path = str(resolved_file.relative_to(rig_parent_root))
+
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                    id, title, status, priority, created_at, updated_at,
+                    claimed_by, lease_until, version, context_path,
+                    parent_id, tags, author, archetype
+                ) VALUES (?, ?, 'todo', 100, ?, ?, NULL, NULL, 0, ?, NULL, 'follow-up', ?, 'diff_synthesizer')
+                """,
+                (fu_id, fu_title, now, now, context_path, fu_author),
+            )
+            conn.execute(
+                """
+                INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
+                VALUES (?, 'created', ?, ?, ?)
+                """,
+                (
+                    fu_id,
+                    fu_author,
+                    json.dumps({"title": fu_title, **created_payload_base}),
+                    now,
+                ),
+            )
+            created.append((fu_id, fu_title, fu_file))
+
+        return created
+
+    def _commit_completion_and_follow_ups(
+        self,
+        *,
+        task: Dict[str, Any],
+        cas_sql: str,
+        cas_params: Tuple[Any, ...],
+        cas_fail_msg: str,
+        event_agent: str,
+        audit_agent: str,
+        verification_status: str,
+        event_payload: Dict[str, Any],
+        fu_author: str,
+        norm_follow_ups: Tuple[str, ...],
+        follow_up_ids_out: Optional[List[str]],
+        now: str,
+        success_msg: str,
+    ) -> Tuple[bool, str]:
+        """Execute CAS completion, optional follow-up inserts, scaffolds, and audit logs."""
+        task_id = str(task["id"])
+        origin_parent_id = task.get("parent_id")
+        created_fu_records: List[Tuple[str, str, Path]] = []
+
+        with self.get_queue_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(cas_sql, cas_params)
+            if cur.rowcount != 1:
+                return False, cas_fail_msg
+
+            if norm_follow_ups:
+                created_fu_records = self._insert_follow_up_tasks(
+                    conn,
+                    origin_task_id=task_id,
+                    origin_parent_id=origin_parent_id,
+                    fu_author=fu_author,
+                    follow_ups=norm_follow_ups,
+                    now=now,
+                )
+                created_fu_ids = [fu_id for fu_id, _, _ in created_fu_records]
+                if created_fu_ids:
+                    event_payload["follow_up_ids"] = list(created_fu_ids)
+
+            conn.execute(
+                """
+                INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
+                VALUES (?, 'completed', ?, ?, ?)
+                """,
+                (task_id, event_agent, json.dumps(event_payload), now),
+            )
+            conn.commit()
+
+        for fu_id, fu_title, fu_file in created_fu_records:
+            if not fu_file.exists() and not _is_link_or_junction(fu_file):
+                scaffold = (
+                    f"# {fu_id}: {fu_title}\n\n"
+                    f"- **Parent**: None\n"
+                    f"- **Origin**: {task_id}\n"
+                    f"- **Archetype**: `diff_synthesizer`\n"
+                    f"- **Tags**: follow-up\n"
+                    f"- **Author**: {fu_author}\n"
+                    f"- **Created**: {now}\n\n"
+                    f"## Description\n\n"
+                    f"Follow-up task spawned from {task_id}.\n"
+                )
+                _atomic_write_text(fu_file, scaffold)
+
+        self.log_audit(
+            task_id=task_id,
+            action="task_completed",
+            agent=audit_agent,
+            verification_status=verification_status,
+            payload=json.dumps(event_payload),
+        )
+
+        fu_audit_author = fu_author.replace("\r", " ").replace("\n", " ").strip()
+        for fu_id, fu_title, _ in created_fu_records:
+            self.log_audit(
+                task_id=fu_id,
+                action="task_created",
+                agent=fu_audit_author,
+                verification_status="unverified",
+                payload=json.dumps({
+                    "title": fu_title,
+                    "parent_id": None,
+                    "origin_task_id": task_id,
+                    "origin_parent_id": origin_parent_id,
+                }),
+            )
+
+        if follow_up_ids_out is not None and created_fu_records:
+            follow_up_ids_out.extend(fu_id for fu_id, _, _ in created_fu_records)
+
+        self.sync_board()
+        return True, success_msg
+
     def complete_task(
         self,
         task_id: str,
@@ -944,6 +1418,8 @@ Add task details and acceptance criteria here.
         evidence_paths: Optional[Sequence[str | Path]] = None,
         touched_paths: Optional[Sequence[str | Path]] = None,
         model_id: Optional[str] = None,
+        follow_ups: Optional[Sequence[str]] = None,
+        follow_up_ids_out: Optional[List[str]] = None,
     ) -> Tuple[bool, str]:
         """Mark task as done enforcing anti-self-approval and intentional friction when required."""
         self._validate_task_id(task_id)
@@ -961,6 +1437,12 @@ Add task details and acceptance criteria here.
             raise ValueError("session_id must be a non-empty printable string")
         resolved_model = resolve_model_id(model_id)
         norm_touched = self._validate_touched_paths(touched_paths)
+        norm_follow_ups = self._validate_follow_ups(follow_ups, follow_up_ids_out)
+        if norm_follow_ups:
+            if _is_link_or_junction(self.tasks_dir):
+                raise ValueError(f"Refusing symlink or junction for tasks directory: {self.tasks_dir}")
+            if self.tasks_dir.exists() and not self.tasks_dir.is_dir():
+                raise ValueError(f"Tasks path is not a directory: {self.tasks_dir}")
         self._ensure_queue_ready()
         self._ensure_audit_ready()
         task = self.get_task(task_id)
@@ -968,6 +1450,8 @@ Add task details and acceptance criteria here.
             return False, f"Task {task_id} not found"
 
         if task["status"] == "done":
+            if norm_follow_ups:
+                return False, f"Cannot attach follow-up tasks to '{task_id}': task is already completed"
             return True, f"Task {task_id} already completed"
 
         # D3-04: Open child guard
@@ -1030,10 +1514,9 @@ Add task details and acceptance criteria here.
             event_payload["evidence"] = evidence_records
         version = task.get("version", 0)
 
-        with self.get_queue_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
+        return self._commit_completion_and_follow_ups(
+            task=task,
+            cas_sql="""
                 UPDATE tasks
                 SET status = 'done',
                     lease_until = NULL,
@@ -1044,35 +1527,19 @@ Add task details and acceptance criteria here.
                   AND claimed_by = ?
                   AND version = ?
                   AND (lease_until IS NULL OR lease_until >= ?)
-                """,
-                (now, task_id, agent, version, now),
-            )
-            if cur.rowcount != 1:
-                return False, f"Concurrent modification detected or lease lost on task '{task_id}' (expected version {version})"
-
-            conn.execute(
-                """
-                INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
-                VALUES (?, 'completed', ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    agent,
-                    json.dumps(event_payload),
-                    now,
-                ),
-            )
-            conn.commit()
-
-        self.log_audit(
-            task_id=task_id,
-            action="task_completed",
-            agent=agent.replace("\r", " ").replace("\n", " "),
+            """,
+            cas_params=(now, task_id, agent, version, now),
+            cas_fail_msg=f"Concurrent modification detected or lease lost on task '{task_id}' (expected version {version})",
+            event_agent=agent,
+            audit_agent=agent.replace("\r", " ").replace("\n", " "),
             verification_status="verified" if verifier else "unverified",
-            payload=json.dumps(event_payload),
+            event_payload=event_payload,
+            fu_author=(verifier or agent).strip(),
+            norm_follow_ups=norm_follow_ups,
+            follow_up_ids_out=follow_up_ids_out,
+            now=now,
+            success_msg="Task completed successfully",
         )
-        self.sync_board()
-        return True, "Task completed successfully"
 
     def submit_for_review(
         self,
@@ -1184,6 +1651,8 @@ Add task details and acceptance criteria here.
         evidence_paths: Optional[Sequence[str | Path]] = None,
         touched_paths: Optional[Sequence[str | Path]] = None,
         model_id: Optional[str] = None,
+        follow_ups: Optional[Sequence[str]] = None,
+        follow_up_ids_out: Optional[List[str]] = None,
     ) -> Tuple[bool, str]:
         """Approve a task in review and transition it to done with independent verifier enforcement."""
         self._validate_task_id(task_id)
@@ -1194,6 +1663,12 @@ Add task details and acceptance criteria here.
             raise ValueError("session_id must be a non-empty printable string")
         resolved_model = resolve_model_id(model_id)
         norm_touched = self._validate_touched_paths(touched_paths)
+        norm_follow_ups = self._validate_follow_ups(follow_ups, follow_up_ids_out)
+        if norm_follow_ups:
+            if _is_link_or_junction(self.tasks_dir):
+                raise ValueError(f"Refusing symlink or junction for tasks directory: {self.tasks_dir}")
+            if self.tasks_dir.exists() and not self.tasks_dir.is_dir():
+                raise ValueError(f"Tasks path is not a directory: {self.tasks_dir}")
 
         self._ensure_queue_ready()
         self._ensure_audit_ready()
@@ -1202,6 +1677,8 @@ Add task details and acceptance criteria here.
             return False, f"Task {task_id} not found"
 
         if task["status"] == "done":
+            if norm_follow_ups:
+                return False, f"Cannot attach follow-up tasks to '{task_id}': task is already completed"
             return True, f"Task {task_id} already completed"
 
         with self.get_queue_conn() as conn:
@@ -1290,10 +1767,9 @@ Add task details and acceptance criteria here.
         if evidence_records:
             event_payload["evidence"] = evidence_records
 
-        with self.get_queue_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
+        return self._commit_completion_and_follow_ups(
+            task=task,
+            cas_sql="""
                 UPDATE tasks
                 SET status = 'done',
                     lease_until = NULL,
@@ -1302,30 +1778,19 @@ Add task details and acceptance criteria here.
                 WHERE id = ?
                   AND status = 'review'
                   AND version = ?
-                """,
-                (now, task_id, version),
-            )
-            if cur.rowcount != 1:
-                return False, f"Concurrent modification detected on task '{task_id}' (expected version {version})"
-
-            conn.execute(
-                """
-                INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
-                VALUES (?, 'completed', ?, ?, ?)
-                """,
-                (task_id, verifier, json.dumps(event_payload), now),
-            )
-            conn.commit()
-
-        self.log_audit(
-            task_id=task_id,
-            action="task_completed",
-            agent=verifier.replace("\r", " ").replace("\n", " "),
+            """,
+            cas_params=(now, task_id, version),
+            cas_fail_msg=f"Concurrent modification detected on task '{task_id}' (expected version {version})",
+            event_agent=verifier,
+            audit_agent=verifier.replace("\r", " ").replace("\n", " "),
             verification_status="verified",
-            payload=json.dumps(event_payload),
+            event_payload=event_payload,
+            fu_author=verifier.strip(),
+            norm_follow_ups=norm_follow_ups,
+            follow_up_ids_out=follow_up_ids_out,
+            now=now,
+            success_msg="Task review approved and completed",
         )
-        self.sync_board()
-        return True, "Task review approved and completed"
 
     def get_next_workflow_step(self, task_id: str) -> Dict[str, Any]:
         """Compute next workflow step under parent task or epic enforcing workflow rails."""

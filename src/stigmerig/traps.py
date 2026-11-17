@@ -91,6 +91,9 @@ MAX_FILE_SIZE: int = 2 * 1024 * 1024
 _NON_PRESCRIPTIVE_PLACEHOLDERS: frozenset[str] = frozenset({"n/a", "na", "none", "tbd"})
 _BARE_ATOM_PATTERN: re.Pattern[str] = re.compile(r"^ATOM-[A-Za-z0-9_-]+$")
 _TRAP_NUM_PATTERN: re.Pattern[str] = re.compile(r"^TRAP-(\d+)$")
+_RUST_CHAR_LITERAL_RE: re.Pattern[str] = re.compile(
+    r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\}|.)|[^'\\\r\n])'"
+)
 
 _LINK_REPARSE_TAGS: frozenset[int] = frozenset({
     getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C),
@@ -266,6 +269,49 @@ STARTER_TRAP_PACKS: Dict[str, Tuple[Dict[str, Any], ...]] = {
             "fixtures": {
                 "positive": "if let " + "Err(_err) = stream.flush() {}",
                 "negative": "if let Err(err) = stream.flush() { eprintln!(\"flush failed: {err}\"); }",
+            },
+        },
+        {
+            "trap_id": "TRAP-RS-003",
+            "domain": "rust-hygiene",
+            "title": "Unchecked Rust Unwrap, Expect, or Panic in Production",
+            "trigger_pattern": (
+                r'^(?:[^/"\n]|/(?![/*])|"(?:\\.|[^"\\])*")*'
+                r'(?:\.(?:unwrap\s*\(\s*\)|expect\s*\()|\bpanic!\s*\()'
+            ),
+            "forbidden_claim_or_action": (
+                "Calling .unwrap\x28), .expect\x28), or panic!\x28) in production Rust modules, "
+                "risking unrecoverable thread panics."
+            ),
+            "remediation": (
+                "Propagate failures with ?, use unwrap_or_else for fallback defaults, "
+                "or return Result per clippy::unwrap_used."
+            ),
+            "match_mode": "line",
+            "target_globs": ["**/*.rs", "!tests/**", "!**/tests/**", "!**/benches/**", "!**/examples/**"],
+            "fixtures": {
+                "positive": "let cfg = load_cfg()." + "unwrap();",
+                "negative": "let cfg = load_cfg()?;\nlet port = maybe_port.unwrap_or(8080);",
+            },
+        },
+        {
+            "trap_id": "TRAP-RS-004",
+            "domain": "rust-hygiene",
+            "title": "Unfinished Rust Stub Macro",
+            "trigger_pattern": (
+                r'^(?:[^/"\n]|/(?![/*])|"(?:\\.|[^"\\])*")*\b(?:todo|unimplemented)!\s*\('
+            ),
+            "forbidden_claim_or_action": (
+                "Leaving unfinished to" + "do!\x28) or unimplemented!\x28) stub macros in production Rust code paths."
+            ),
+            "remediation": (
+                "Complete the implementation or return an explicit Result::Err variant before committing per clippy::todo."
+            ),
+            "match_mode": "line",
+            "target_globs": ["**/*.rs", "!tests/**", "!**/tests/**", "!**/benches/**", "!**/examples/**"],
+            "fixtures": {
+                "positive": "pub fn parse() -> usize { to" + "do!(\"wire parser\") }",
+                "negative": "pub fn parse() -> Result<usize, ParseError> { Result::Err(ParseError::Unsupported) }",
             },
         },
     ),
@@ -1053,6 +1099,329 @@ def load_promoted_traps(
     return [normalize_trap_record(t) for t in selected]
 
 
+def _is_rust_ident_char(ch: str) -> bool:
+    return ch == "_" or ch.isalnum()
+
+
+def _scan_rust_quoted_string(content: str, idx: int, n: int) -> int:
+    while idx < n:
+        ch = content[idx]
+        if ch == "\\":
+            idx += 2
+        elif ch == '"':
+            return idx + 1
+        else:
+            idx += 1
+    return n
+
+
+def _scan_rust_raw_string(content: str, idx: int, hashes: int, n: int) -> int:
+    closing = '"' + ("#" * hashes)
+    pos = content.find(closing, idx)
+    if pos == -1:
+        return n
+    return pos + len(closing)
+
+
+def _skip_rust_non_code_token(content: str, idx: int, n: int) -> int:
+    """Advance past a Rust comment, string, raw/byte/C string, or char/byte literal."""
+    ch = content[idx]
+
+    if ch == "/" and idx + 1 < n:
+        nxt = content[idx + 1]
+        if nxt == "/":
+            nl = content.find("\n", idx + 2)
+            return n if nl == -1 else nl + 1
+        if nxt == "*":
+            depth = 1
+            j = idx + 2
+            while j < n and depth > 0:
+                if content[j] == "/" and j + 1 < n and content[j + 1] == "*":
+                    depth += 1
+                    j += 2
+                elif content[j] == "*" and j + 1 < n and content[j + 1] == "/":
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            return j
+
+    if ch == '"':
+        return _scan_rust_quoted_string(content, idx + 1, n)
+
+    if idx == 0 or not _is_rust_ident_char(content[idx - 1]):
+        prefix_len = 0
+        if ch == "r":
+            prefix_len = 1
+        elif ch in ("b", "c") and idx + 1 < n and content[idx + 1] == "r":
+            prefix_len = 2
+
+        if prefix_len > 0:
+            j = idx + prefix_len
+            hashes = 0
+            while j < n and content[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and content[j] == '"':
+                return _scan_rust_raw_string(content, j + 1, hashes, n)
+
+        if ch in ("b", "c") and idx + 1 < n and content[idx + 1] == '"':
+            return _scan_rust_quoted_string(content, idx + 2, n)
+
+        if ch == "b" and idx + 1 < n and content[idx + 1] == "'":
+            m = _RUST_CHAR_LITERAL_RE.match(content, idx + 1)
+            if m is not None:
+                return m.end()
+
+    if ch == "'":
+        m = _RUST_CHAR_LITERAL_RE.match(content, idx)
+        if m is not None:
+            return m.end()
+
+    return idx
+
+
+def _skip_rust_trivia(content: str, idx: int, n: int) -> int:
+    while idx < n:
+        if content[idx].isspace():
+            idx += 1
+            continue
+        if content[idx] == "/" and idx + 1 < n and content[idx + 1] in ("/", "*"):
+            nxt = _skip_rust_non_code_token(content, idx, n)
+            if nxt > idx:
+                idx = nxt
+                continue
+        break
+    return idx
+
+
+def _tokenize_rust_cfg_predicate(pred: str) -> List[Tuple[str, str]]:
+    tokens: List[Tuple[str, str]] = []
+    i = 0
+    n = len(pred)
+    while i < n:
+        if pred[i].isspace():
+            i += 1
+            continue
+        if pred[i] == "/" and i + 1 < n and pred[i + 1] in ("/", "*"):
+            i = _skip_rust_non_code_token(pred, i, n)
+            continue
+        nxt = _skip_rust_non_code_token(pred, i, n)
+        if nxt > i:
+            tokens.append(("LIT", pred[i:nxt]))
+            i = nxt
+            continue
+        ch = pred[i]
+        if ch == "_" or ch.isalpha():
+            j = i + 1
+            while j < n and _is_rust_ident_char(pred[j]):
+                j += 1
+            tokens.append(("IDENT", pred[i:j]))
+            i = j
+            continue
+        if ch in ("(", ")", ",", "="):
+            tokens.append((ch, ch))
+        else:
+            tokens.append(("OTHER", ch))
+        i += 1
+    return tokens
+
+
+def _skip_cfg_item_tail(tokens: Sequence[Tuple[str, str]], pos: int) -> int:
+    depth = 0
+    n = len(tokens)
+    while pos < n:
+        kind = tokens[pos][0]
+        if kind == "(":
+            depth += 1
+        elif kind == ")":
+            if depth == 0:
+                return pos
+            depth -= 1
+        elif kind == "," and depth == 0:
+            return pos
+        pos += 1
+    return pos
+
+
+def _parse_cfg_predicate_item(tokens: Sequence[Tuple[str, str]], pos: int) -> Tuple[bool, int]:
+    n = len(tokens)
+    if pos >= n or tokens[pos][0] != "IDENT":
+        return False, _skip_cfg_item_tail(tokens, pos)
+
+    name = tokens[pos][1]
+    pos += 1
+
+    if pos < n and tokens[pos][0] == "(":
+        pos += 1
+        arg_results: List[bool] = []
+        while pos < n and tokens[pos][0] != ")":
+            arg_ok, pos = _parse_cfg_predicate_item(tokens, pos)
+            arg_results.append(arg_ok)
+            if pos < n and tokens[pos][0] == ",":
+                pos += 1
+            elif pos < n and tokens[pos][0] != ")":
+                pos = _skip_cfg_item_tail(tokens, pos)
+                if pos < n and tokens[pos][0] == ",":
+                    pos += 1
+        if pos < n and tokens[pos][0] == ")":
+            pos += 1
+        if pos < n and tokens[pos][0] not in (",", ")"):
+            return False, _skip_cfg_item_tail(tokens, pos)
+        if name == "all":
+            return any(arg_results), pos
+        return False, pos
+
+    if pos < n and tokens[pos][0] == "=":
+        return False, _skip_cfg_item_tail(tokens, pos)
+
+    if pos < n and tokens[pos][0] not in (",", ")"):
+        return False, _skip_cfg_item_tail(tokens, pos)
+
+    return name == "test", pos
+
+
+def _cfg_predicate_targets_test(pred: str) -> bool:
+    tokens = _tokenize_rust_cfg_predicate(pred)
+    if not tokens:
+        return False
+    matched, pos = _parse_cfg_predicate_item(tokens, 0)
+    return matched and pos == len(tokens)
+
+
+def _match_cfg_test_attribute(content: str, hash_idx: int, n: int) -> Optional[int]:
+    j = _skip_rust_trivia(content, hash_idx + 1, n)
+    if j >= n or content[j] != "[":
+        return None
+    j = _skip_rust_trivia(content, j + 1, n)
+    if not content.startswith("cfg", j):
+        return None
+    ident_end = j + 3
+    if ident_end < n and _is_rust_ident_char(content[ident_end]):
+        return None
+    j = _skip_rust_trivia(content, ident_end, n)
+    if j >= n or content[j] != "(":
+        return None
+
+    pred_start = j + 1
+    j = pred_start
+    paren_depth = 1
+    while j < n and paren_depth > 0:
+        nxt = _skip_rust_non_code_token(content, j, n)
+        if nxt > j:
+            j = nxt
+            continue
+        ch = content[j]
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth -= 1
+            if paren_depth == 0:
+                break
+        j += 1
+
+    if paren_depth != 0:
+        return None
+
+    pred_end = j
+    j = _skip_rust_trivia(content, j + 1, n)
+    if j >= n or content[j] != "]":
+        return None
+
+    if not _cfg_predicate_targets_test(content[pred_start:pred_end]):
+        return None
+
+    return j + 1
+
+
+def _find_rust_cfg_test_span_end(content: str, idx: int, n: int) -> Optional[int]:
+    paren_depth = 0
+    brace_depth = 0
+    bracket_depth = 0
+    entered_brace = False
+
+    while idx < n:
+        nxt = _skip_rust_non_code_token(content, idx, n)
+        if nxt > idx:
+            idx = nxt
+            continue
+
+        ch = content[idx]
+        if not entered_brace:
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")":
+                if paren_depth > 0:
+                    paren_depth -= 1
+            elif ch == "[":
+                bracket_depth += 1
+            elif ch == "]":
+                if bracket_depth > 0:
+                    bracket_depth -= 1
+            elif ch == ";" and brace_depth == 0 and paren_depth == 0 and bracket_depth == 0:
+                return idx + 1
+            elif ch == "{":
+                if paren_depth == 0 and bracket_depth == 0 and brace_depth == 0:
+                    entered_brace = True
+                brace_depth += 1
+            elif ch == "}":
+                if brace_depth == 0 and paren_depth == 0 and bracket_depth == 0:
+                    return idx
+                if brace_depth > 0:
+                    brace_depth -= 1
+        else:
+            if ch == "{":
+                brace_depth += 1
+            elif ch == "}":
+                brace_depth -= 1
+                if brace_depth == 0:
+                    return idx + 1
+        idx += 1
+
+    return n if entered_brace else None
+
+
+def _mask_rust_cfg_test_blocks(content: str) -> str:
+    """Replace #[cfg(test)] / #[cfg(all(..., test, ...))] spans with ASCII spaces, preserving newlines."""
+    if "#" not in content or "cfg" not in content:
+        return content
+
+    n = len(content)
+    chunks: List[str] = []
+    last_emit = 0
+    i = 0
+
+    while i < n:
+        nxt = _skip_rust_non_code_token(content, i, n)
+        if nxt > i:
+            i = nxt
+            continue
+
+        if content[i] == "#":
+            attr_end = _match_cfg_test_attribute(content, i, n)
+            if attr_end is not None:
+                span_end = _find_rust_cfg_test_span_end(content, attr_end, n)
+                if span_end is not None:
+                    if i > last_emit:
+                        chunks.append(content[last_emit:i])
+                    chunks.append(
+                        "".join(ch if ch in ("\n", "\r") else " " for ch in content[i:span_end])
+                    )
+                    last_emit = span_end
+                    i = span_end
+                    continue
+                i = attr_end
+                continue
+
+        i += 1
+
+    if not chunks:
+        return content
+    if last_emit < n:
+        chunks.append(content[last_emit:])
+    return "".join(chunks)
+
+
 def audit_content_for_traps(
     content: str,
     traps: Sequence[Mapping[str, Any]],
@@ -1067,6 +1436,8 @@ def audit_content_for_traps(
     violations: List[Dict[str, Any]] = []
     lines = content.splitlines()
     f_path = Path(file_path) if file_path else None
+    _masked_content: Optional[str] = None
+    _masked_lines: Optional[List[str]] = None
 
     for trap in traps:
         raw_globs = trap.get("target_globs")
@@ -1093,6 +1464,36 @@ def audit_content_for_traps(
         except re.error:
             continue
 
+        is_rust_target = (
+            (f_path is not None and f_path.suffix.lower() == ".rs")
+            or (
+                f_path is None
+                and any(
+                    str(g).strip().lower().endswith(".rs")
+                    for g in target_globs
+                    if not str(g).strip().startswith("!")
+                )
+            )
+        )
+        negates_tests = any(
+            str(g).strip().startswith("!")
+            and ("test" in str(g).lower() or "bench" in str(g).lower())
+            for g in target_globs
+        )
+        if is_rust_target and negates_tests:
+            if _masked_content is None:
+                _masked_content = _mask_rust_cfg_test_blocks(content)
+            scan_content = _masked_content
+            if match_mode != "multiline":
+                if _masked_lines is None:
+                    _masked_lines = lines if _masked_content == content else _masked_content.splitlines()
+                scan_lines = _masked_lines
+            else:
+                scan_lines = lines
+        else:
+            scan_content = content
+            scan_lines = lines
+
         trap_id = _extract_trap_id(trap) or "TRAP-UNKNOWN"
         title = str(trap.get("title") or "")
         domain = str(trap.get("domain") or "")
@@ -1100,9 +1501,10 @@ def audit_content_for_traps(
         remediation = _extract_remediation(trap)
 
         if match_mode == "multiline":
-            for match in compiled.finditer(content):
-                line_no = content.count("\n", 0, match.start()) + 1
-                snippet = re.sub(r"\s+", " ", match.group(0)).strip()[:100]
+            for match in compiled.finditer(scan_content):
+                line_no = scan_content.count("\n", 0, match.start()) + 1
+                raw_match = content[match.start():match.end()]
+                snippet = re.sub(r"\s+", " ", raw_match).strip()[:100]
                 violations.append({
                     "trap_id": trap_id,
                     "title": title,
@@ -1114,8 +1516,9 @@ def audit_content_for_traps(
                     "snippet": snippet,
                 })
         else:
-            for line_no, line in enumerate(lines, 1):
+            for line_no, line in enumerate(scan_lines, 1):
                 if compiled.search(line):
+                    orig_line = lines[line_no - 1] if 0 <= line_no - 1 < len(lines) else line
                     violations.append({
                         "trap_id": trap_id,
                         "title": title,
@@ -1124,7 +1527,7 @@ def audit_content_for_traps(
                         "remediation": remediation,
                         "file": file_path,
                         "line": line_no,
-                        "snippet": line.strip()[:100],
+                        "snippet": orig_line.strip()[:100],
                     })
 
     return violations

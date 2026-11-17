@@ -16,8 +16,12 @@ import unittest
 import stigmerig.cli as cli
 from stigmerig.db import StigmeRigDB
 from stigmerig.traps import (
+    _mask_rust_cfg_test_blocks,
+    audit_content_for_traps,
+    audit_file,
     collect_scannable_files,
     is_target_applicable,
+    load_promoted_traps,
     seed_starter_traps,
     validate_traps_cli_args,
     verify_trap_fixtures,
@@ -206,20 +210,20 @@ class TestStandaloneUninitializedCliScanAndVerify(_HermeticTempTestCase):
         self.assertEqual(rc_seed, 0, err_seed)
         seed_report = json.loads(out_seed)
         self.assertTrue(seed_report["ok"])
-        self.assertEqual(seed_report["seeded_count"], 11)
+        self.assertEqual(seed_report["seeded_count"], 13)
 
         # 3. Verify fixtures via CLI without queue.db or audit.db.
         rc_ver, out_ver, err_ver = self.run_cli(["traps", "verify", "--json"], cwd=repo)
         self.assertEqual(rc_ver, 0, err_ver)
         ver_report = json.loads(out_ver)
         self.assertTrue(ver_report["ok"])
-        self.assertEqual(ver_report["verified_traps"], 11)
+        self.assertEqual(ver_report["verified_traps"], 13)
         self.assertEqual(ver_report["errors"], [])
 
         # 4. Scan clean polyglot repository and verify zero violations.
         rc_scan_txt, out_scan_txt, err_scan_txt = self.run_cli(["traps", "scan", "."], cwd=repo)
         self.assertEqual(rc_scan_txt, 0, err_scan_txt)
-        self.assertIn("[PASS] Scanned 7 file(s) against 11 active trap(s): zero violations.", out_scan_txt)
+        self.assertIn("[PASS] Scanned 7 file(s) against 13 active trap(s): zero violations.", out_scan_txt)
 
         # Confirm zero SQLite databases were created.
         self.assertTrue((repo / ".stigmerig" / "traps.json").is_file())
@@ -306,7 +310,7 @@ class TestStarterPacksAndMultilineCliFixtures(_HermeticTempTestCase):
             "generic": 1,
             "python": 2,
             "typescript": 2,
-            "rust": 2,
+            "rust": 4,
             "go": 1,
             "verification": 3,
         }
@@ -339,7 +343,7 @@ class TestStarterPacksAndMultilineCliFixtures(_HermeticTempTestCase):
             ],
         )
         self.assertEqual(rc_seed, 0, err_seed)
-        self.assertEqual(json.loads(out_seed)["seeded_count"], 11)
+        self.assertEqual(json.loads(out_seed)["seeded_count"], 13)
 
         ok_all, errors_all, count_all = verify_trap_fixtures(
             all_reg,
@@ -347,7 +351,7 @@ class TestStarterPacksAndMultilineCliFixtures(_HermeticTempTestCase):
             require_prescriptive_on_promoted=True,
         )
         self.assertTrue(ok_all, errors_all)
-        self.assertEqual(count_all, 11)
+        self.assertEqual(count_all, 13)
 
         rc_ver, _, err_ver = self.run_cli(
             [
@@ -1058,6 +1062,236 @@ class TestTwoProcessConcurrentFailTaskAndPromote(_HermeticTempTestCase):
         self.assertEqual(hit_ids, {"TRAP-PY-001", "TRAP-LOCAL-001"})
         # stigmerig.traps.json itself must be excluded from scanning
         self.assertEqual(report["scanned_files"], 1)
+
+
+class TestRustHygieneAndCfgTestMasking(_HermeticTempTestCase):
+    """Verify TRAP-RS-003/004, Rust #[cfg(test)] masking, lazy audit masking, and self-scan cleanliness."""
+
+    def _seed_all_traps(self, name: str = "all_traps.json") -> tuple[Path, list[dict[str, object]]]:
+        reg_path = self.tmp_dir / name
+        seed_starter_traps(reg_path, pack="all", status="promoted")
+        return reg_path, load_promoted_traps(reg_path)
+
+    def test_rust_production_unwrap_expect_panic_and_stub_macros_vs_safe_patterns(self) -> None:
+        reg_path, _ = self._seed_all_traps("rust_rules.json")
+        crate = self.tmp_dir / "rust_crate"
+        (crate / "src").mkdir(parents=True)
+        (crate / "tests").mkdir(parents=True)
+        (crate / "benches").mkdir(parents=True)
+        (crate / "examples").mkdir(parents=True)
+
+        src_lines = [
+            "pub fn load_item(raw: Option<i32>, res: Result<i32, &'static str>) -> i32 {",
+            "    let ratio = 10 / 2;",
+            "    let a = raw.unwrap();",
+            "    let b = res.expect(\"missing item\");",
+            "    if ratio < 0 { panic!(\"negative ratio\"); }",
+            "    a + b",
+            "}",
+            "pub fn parse_next() -> usize { todo!(\"wire parser\") }",
+            "pub fn fallback() -> usize { unimplemented!() }",
+            "pub fn clean_code(raw: Option<i32>, res: Result<i32, &'static str>) -> Result<i32, &'static str> {",
+            "    let a = raw.unwrap_or(0);",
+            "    let b = raw.unwrap_or_else(|| 1);",
+            "    let c = res?;",
+            "    let msg = \"do not .unwrap() or .expect(\\\"x\\\") or panic!() or todo!() or unimplemented!()\";",
+            "    // raw.unwrap() res.expect(\"ok\") panic!(\"no\") todo!(\"no\") unimplemented!()",
+            "    let d = a + b; /* raw.unwrap() res.expect(\"ok\") panic!(\"no\") todo!() unimplemented!() */",
+            "    Ok(c + d)",
+            "}",
+            "pub fn err_ret() -> Result<usize, &'static str> { Result::Err(\"unsupported\") }",
+        ]
+        (crate / "src" / "lib.rs").write_text("\n".join(src_lines) + "\n", encoding="utf-8")
+
+        # Excluded Rust directories must never trigger TRAP-RS-003 or TRAP-RS-004.
+        (crate / "tests" / "integration.rs").write_text(
+            "#[test]\nfn it_works() { let _ = Some(1).unwrap(); panic!(\"ok in test\"); todo!(); }\n",
+            encoding="utf-8",
+        )
+        (crate / "benches" / "throughput.rs").write_text(
+            "pub fn bench_fn() { let _ = Some(1).unwrap(); unimplemented!(); }\n",
+            encoding="utf-8",
+        )
+        (crate / "examples" / "demo.rs").write_text(
+            "fn main() { let _ = Some(1).expect(\"demo\"); todo!(); }\n",
+            encoding="utf-8",
+        )
+
+        rc_scan, out_scan, _ = self.run_cli(
+            ["traps", "scan", str(crate), "--registry", str(reg_path), "--json"],
+            cwd=crate,
+        )
+        self.assertEqual(rc_scan, 1)
+        report = json.loads(out_scan)
+        self.assertEqual(report["scanned_files"], 4)
+
+        found = {(Path(v["file"]).name, v["trap_id"], v["line"]) for v in report["violations"]}
+        self.assertEqual(
+            found,
+            {
+                ("lib.rs", "TRAP-RS-003", 3),
+                ("lib.rs", "TRAP-RS-003", 4),
+                ("lib.rs", "TRAP-RS-003", 5),
+                ("lib.rs", "TRAP-RS-004", 8),
+                ("lib.rs", "TRAP-RS-004", 9),
+            },
+        )
+        by_id = {v["trap_id"]: v for v in report["violations"]}
+        self.assertIn("?", by_id["TRAP-RS-003"]["remediation"])
+        self.assertIn("unwrap_or_else", by_id["TRAP-RS-003"]["remediation"])
+        self.assertIn("clippy::unwrap_used", by_id["TRAP-RS-003"]["remediation"])
+        self.assertIn("Result::Err", by_id["TRAP-RS-004"]["remediation"])
+        self.assertIn("clippy::todo", by_id["TRAP-RS-004"]["remediation"])
+
+    def test_colocated_cfg_test_blocks_masked_preserving_lines_and_trailing_production_code(self) -> None:
+        _, traps = self._seed_all_traps("cfg_mask.json")
+        rust_src = "\n".join([
+            "pub fn head_ok() -> usize { 1 }",
+            "#[cfg(test)]",
+            "#[allow(dead_code)]",
+            "mod tests {",
+            "    fn helper<'a>(input: &'a str) -> &'a str {",
+            "        let _raw_bytes = br#\"}\"#;",
+            "        let _raw_c = cr#\"}\"#;",
+            "        let _cstr = c\"}\";",
+            "        let _ch = '}';",
+            "        let _bch = b'\\x7d';",
+            "        let _uni = '\\u{03BB}';",
+            "        /* /* nested } brace comment */ */",
+            "        'outer: loop {",
+            "            break 'outer;",
+            "        }",
+            "        let _v = Some(1).unwrap();",
+            "        let _e = Ok::<i32, &str>(1).expect(\"test only\");",
+            "        if false { panic!(\"test\"); todo!(\"test\"); unimplemented!(\"test\"); }",
+            "        input",
+            "    }",
+            "}",
+            "#[cfg(all(unix, test))]",
+            "mod unix_tests {",
+            "    fn u() { let _ = Some(2).unwrap(); }",
+            "}",
+            "#[cfg(test)]",
+            "fn test_buf() -> [u8; 4] { let _ = Some(3).unwrap(); [0; 4] }",
+            "#[cfg(not(test))]",
+            "pub fn prod_cfg_not_test() -> i32 { Some(4).unwrap() }",
+            "#[cfg(all(unix, not(test)))]",
+            "pub fn prod_cfg_all_not_test() -> i32 { Some(5).unwrap() }",
+            "#[cfg(feature = \"test\")]",
+            "pub fn prod_feature_test() -> i32 { Some(6).unwrap() }",
+            "#[cfg(any(test, debug_assertions))]",
+            "pub fn prod_any_cfg() -> i32 { Some(7).unwrap() }",
+            "pub fn trailing_prod_unwrap() -> i32 {",
+            "    Some(8).unwrap()",
+            "}",
+            "pub fn trailing_prod_todo() -> usize {",
+            "    todo!(\"finish prod\")",
+            "}",
+        ]) + "\n"
+
+        masked = _mask_rust_cfg_test_blocks(rust_src)
+        self.assertEqual(len(masked), len(rust_src))
+        self.assertEqual(len(masked.splitlines()), len(rust_src.splitlines()))
+
+        violations = audit_content_for_traps(rust_src, traps, file_path="src/engine.rs")
+        hits = {(v["trap_id"], v["line"], v["snippet"]) for v in violations}
+        self.assertEqual(
+            hits,
+            {
+                ("TRAP-RS-003", 29, "pub fn prod_cfg_not_test() -> i32 { Some(4).unwrap() }"),
+                ("TRAP-RS-003", 31, "pub fn prod_cfg_all_not_test() -> i32 { Some(5).unwrap() }"),
+                ("TRAP-RS-003", 33, "pub fn prod_feature_test() -> i32 { Some(6).unwrap() }"),
+                ("TRAP-RS-003", 35, "pub fn prod_any_cfg() -> i32 { Some(7).unwrap() }"),
+                ("TRAP-RS-003", 37, "Some(8).unwrap()"),
+                ("TRAP-RS-004", 40, "todo!(\"finish prod\")"),
+            },
+        )
+
+    def test_external_cfg_test_semicolon_decl_does_not_mask_trailing_production_code(self) -> None:
+        _, traps = self._seed_all_traps("cfg_semi.json")
+        rust_src = "\n".join([
+            "// #[cfg(test)] mod fake_comment {",
+            "pub const DOC: &str = \"#[cfg(test)] mod fake_str {\";",
+            "#[cfg(test)]",
+            "mod tests;",
+            "pub fn run_after_decl() -> i32 {",
+            "    Some(42).unwrap()",
+            "}",
+            "#[cfg(test)]",
+            "use super::helper as _;",
+            "pub fn stub_after_use() -> usize {",
+            "    unimplemented!(\"missing\")",
+            "}",
+        ]) + "\n"
+
+        violations = audit_content_for_traps(rust_src, traps, file_path="src/external_mod.rs")
+        hits = {(v["trap_id"], v["line"]) for v in violations}
+        self.assertEqual(
+            hits,
+            {
+                ("TRAP-RS-003", 6),
+                ("TRAP-RS-004", 11),
+            },
+        )
+
+    def test_audit_content_for_traps_empty_file_path_lazy_masking_and_ver_001_in_cfg_test(self) -> None:
+        _, traps = self._seed_all_traps("lazy_mask.json")
+        rust_src = "\n".join([
+            "#[cfg(test)]",
+            "mod tests {",
+            "    #[test]",
+            "    #[ignore]",
+            "    fn skipped_inside_cfg_test() { let _ = Some(1).unwrap(); }",
+            "    #[test]",
+            "    #[ignore = \"tracked on issue #101\"]",
+            "    fn documented_ignore() {}",
+            "}",
+            "pub fn prod_line() -> i32 { Some(9).unwrap() }",
+        ]) + "\n"
+
+        # Empty file_path must lazily apply Rust masking only for Rust traps negating test paths,
+        # while keeping original content for TRAP-VER-001 (#[ignore] inside #[cfg(test)]).
+        empty_path_hits = audit_content_for_traps(rust_src, traps, file_path="")
+        self.assertEqual(
+            {(v["trap_id"], v["line"]) for v in empty_path_hits},
+            {
+                ("TRAP-VER-001", 4),
+                ("TRAP-RS-003", 10),
+            },
+        )
+
+        # Inline #[cfg(test)] prefix on the same line as production code still preserves the
+        # original line text in line-mode snippet extraction.
+        same_line_src = "#[cfg(test)] mod tests { fn t() { Some(1).unwrap(); } } pub fn p() { Some(2).unwrap(); }\n"
+        same_line_hits = audit_content_for_traps(same_line_src, traps, file_path="src/lib.rs")
+        self.assertEqual(len(same_line_hits), 1)
+        self.assertEqual(same_line_hits[0]["trap_id"], "TRAP-RS-003")
+        self.assertEqual(same_line_hits[0]["line"], 1)
+        self.assertEqual(same_line_hits[0]["snippet"], same_line_src.strip()[:100])
+
+        # Non-Rust files must never trigger Rust #[cfg(test)] masking.
+        py_src = "#[cfg(test)] mod tests {\ndef bad():\n    try:\n        work()\n    ex" + "cept Exception:\n        pass\n# }\n"
+        py_hits = audit_content_for_traps(py_src, traps, file_path="src/app.py")
+        self.assertEqual({v["trap_id"] for v in py_hits}, {"TRAP-PY-001"})
+
+    def test_traps_py_self_scan_zero_violations_across_all_13_starter_traps(self) -> None:
+        reg_path, active_traps = self._seed_all_traps("self_scan_13.json")
+        self.assertEqual(len(active_traps), 13)
+
+        engine_file = Path(__file__).resolve().parent.parent / "src" / "stigmerig" / "traps.py"
+        self_violations = audit_file(engine_file, active_traps, repo_root=engine_file.parent.parent.parent)
+        self.assertEqual(self_violations, [])
+
+        rc_scan, out_scan, err_scan = self.run_cli(
+            ["traps", "scan", str(engine_file), "--registry", str(reg_path), "--json"],
+            cwd=engine_file.parent.parent.parent,
+        )
+        self.assertEqual(rc_scan, 0, err_scan)
+        report = json.loads(out_scan)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["active_traps"], 13)
+        self.assertEqual(report["scanned_files"], 1)
+        self.assertEqual(report["violations"], [])
 
 
 if __name__ == "__main__":

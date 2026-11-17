@@ -75,6 +75,17 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
         ev_strs = [str(os.fspath(item)) for item in items]
         if any(_has_ctrl(s) for s in ev_strs):
             raise ValueError("--evidence must not contain CR/LF, control, or ANSI escape characters")
+    follow_ups = getattr(args, "follow_ups", None)
+    if follow_ups is not None:
+        if not isinstance(follow_ups, (list, tuple)) or not follow_ups:
+            raise ValueError("--follow-up must be a non-empty list of titles")
+        if len(follow_ups) > 10:
+            raise ValueError("--follow-up supports at most 10 items per invocation")
+        for item in follow_ups:
+            if not isinstance(item, str) or not item.strip() or _has_ctrl(item, allow_ws=False):
+                raise ValueError("--follow-up titles must be non-empty single-line printable strings")
+            if len(item.strip()) > 240:
+                raise ValueError("--follow-up titles must not exceed 240 characters")
     for id_field in ("id", "task", "parent"):
         tid = getattr(args, id_field, None)
         if tid is not None and (not isinstance(tid, str) or _has_ctrl(tid) or not TASK_ID_PATTERN.fullmatch(tid)):
@@ -82,6 +93,14 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
     if getattr(args, "parent", None) is not None and getattr(args, "parent", None) == getattr(args, "id", None):
         raise ValueError("--parent must not equal --id")
     cmd, sub = getattr(args, "command", None), getattr(args, "subcommand", None)
+    if cmd == "init":
+        check_flag = bool(getattr(args, "check", False))
+        sync_flag = bool(getattr(args, "sync_icm", False))
+        no_icm_flag = bool(getattr(args, "no_icm", False))
+        if check_flag and sync_flag:
+            raise ValueError("Cannot combine --check with --sync-icm")
+        if no_icm_flag and (check_flag or sync_flag):
+            raise ValueError("Cannot combine --no-icm with --check or --sync-icm")
     if cmd == "task" and sub in ("done", "review", "approve") and getattr(args, "model", None) is None:
         if (env_m := os.environ.get("STIGMERIG_MODEL")) is not None and env_m != "" and (not env_m.strip() or _has_ctrl(env_m)):
             raise ValueError("STIGMERIG_MODEL must not be empty, whitespace, or contain control characters")
@@ -284,6 +303,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_init = subparsers.add_parser("init", help="Initialize coordination state directory")
     p_init.add_argument("--path", type=str, default=None, help="Custom directory path to initialize")
     p_init.add_argument("--no-icm", action="store_true", help="Skip ICM scaffolding (AGENTS.md, CONTEXT.md, rig.json)")
+    p_init.add_argument("--check", action="store_true", help="Verify ICM directive digests without modifying state")
+    p_init.add_argument("--sync-icm", action="store_true", help="Synchronize bounded ICM directive block")
 
     # task
     p_task = subparsers.add_parser("task", help="Manage task lifecycle")
@@ -333,6 +354,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="evidence",
         help="Repeatable path to evidence artifact to hash-bind on completion",
     )
+    p_tdone.add_argument(
+        "--follow-up",
+        action="append",
+        default=None,
+        dest="follow_ups",
+        help="Repeatable follow-up task title to spawn on completion",
+    )
 
     p_trev = task_sub.add_parser("review", help="Submit a working task for review")
     p_trev.add_argument("--id", required=True, help="Task ID to submit for review")
@@ -349,6 +377,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_tapp.add_argument("--session-id", default=None, help="Optional session or run identifier")
     p_tapp.add_argument("--model", default=None, help="Optional foundation model identifier (falls back to STIGMERIG_MODEL)")
     p_tapp.add_argument("--evidence", action="append", default=None, dest="evidence", help="Repeatable evidence artifact path")
+    p_tapp.add_argument(
+        "--follow-up",
+        action="append",
+        default=None,
+        dest="follow_ups",
+        help="Repeatable follow-up task title to spawn on approval",
+    )
 
     p_tfail = task_sub.add_parser("fail", help="Mark a task as blocked or failed")
     p_tfail.add_argument("--id", required=True, help="Task ID")
@@ -417,7 +452,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rig = StigmeRigDB(rig_dir=db_dir)
 
         if args.command == "init":
-            hint = rig.init_rig(scaffold_icm=not getattr(args, "no_icm", False))
+            if getattr(args, "check", False):
+                ok, msg = rig.check_icm()
+                if ok:
+                    print(msg)
+                    return 0
+                print(f"[ERROR] {msg}", file=sys.stderr)
+                return 1
+            hint = rig.init_rig(
+                scaffold_icm=not getattr(args, "no_icm", False),
+                sync_icm=getattr(args, "sync_icm", False),
+            )
             print(f"Initialized StigmeRig in {rig.rig_dir}")
             if hint:
                 print(hint)
@@ -478,6 +523,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 1
 
             if args.subcommand == "done":
+                fu_ids: list[str] = []
                 ok, msg = rig.complete_task(
                     task_id=args.id,
                     agent=args.agent,
@@ -486,15 +532,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     session_id=getattr(args, "session_id", None),
                     evidence_paths=args.evidence,
                     model_id=args.model,
+                    follow_ups=getattr(args, "follow_ups", None),
+                    follow_up_ids_out=fu_ids,
                 )
                 if ok:
                     next_step = rig.get_next_workflow_step(args.id)
-                    res = {
+                    res: dict[str, Any] = {
                         "ok": True,
                         "task_id": args.id,
                         "message": msg,
                         "next_workflow_step": next_step,
                     }
+                    if fu_ids:
+                        res["follow_up_ids"] = fu_ids
                     print(json.dumps(res, indent=2))
                     return 0
                 print(f"[ERROR] Failed to complete task {args.id}: {msg}", file=sys.stderr)
@@ -513,12 +563,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 1
 
             if args.subcommand == "approve":
+                fu_ids = []
                 ok, msg = rig.approve_review(
                     task_id=args.id, verifier=args.verifier, session_id=args.session_id, evidence_paths=args.evidence,
                     model_id=args.model,
+                    follow_ups=getattr(args, "follow_ups", None),
+                    follow_up_ids_out=fu_ids,
                 )
                 if ok:
-                    print(json.dumps({"ok": True, "task_id": args.id, "message": msg, "next_workflow_step": rig.get_next_workflow_step(args.id)}, indent=2))
+                    res = {
+                        "ok": True,
+                        "task_id": args.id,
+                        "message": msg,
+                        "next_workflow_step": rig.get_next_workflow_step(args.id),
+                    }
+                    if fu_ids:
+                        res["follow_up_ids"] = fu_ids
+                    print(json.dumps(res, indent=2))
                     return 0
                 print(f"[ERROR] Failed to approve task {args.id}: {msg}", file=sys.stderr)
                 return 1

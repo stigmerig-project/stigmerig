@@ -130,7 +130,17 @@ StigmeRig excludes five high-ceremony controls that degrade refactoring quality 
   - Prefix-matching secret and shell-pipe regex packs flag documentation examples and create alert fatigue.
   - Dedicated offline entropy scanners run with lower noise, while `TRAP-021` cleanly pins mutable workflow actions.
 
-## Security and Concurrency Invariants (v0.1.5)
+#### Tier 1 vs Tier 3 Scale Boundaries
+
+StigmeRig targets Tier 1 teams with `1-5` engineers and under `50` active tasks.
+Heavy Tier 3 automation (`1,000+` external issues, `500+` contributors) stays outside StigmeRig to protect velocity:
+
+- **Polling GitHub Mirror Daemons**: Background issue polling yields negative ROI below `1,000+` external issues. Route public intake to external triage apps.
+- **Embedded ONNX Vector Search**: Local model downloads break the Python stdlib `dependencies = []` guarantee. Offload embeddings to `Qdrant` or `pgvector`.
+- **Multi-Model Referee Routing Policies**: Model cascades belong in external gateway layers. Delegate routing to Plane 3 routers like `LiteLLM` or `Envoy`.
+- **Speculative `50`-PR Merge Batching**: Multi-PR integration batching exceeds the `3-5` task wave ceiling. Run large queues on dedicated CI orchestration runners.
+
+## Security and Concurrency Invariants (v0.1.6)
 
 StigmeRig enforces operational security and concurrency invariants across all workflows:
 
@@ -148,12 +158,14 @@ StigmeRig enforces operational security and concurrency invariants across all wo
 - **WORM Cryptographic Audit Ledger**: Protects `.stigmerig/audit.db` with SHA-256 hash chaining and SQLite `BEFORE UPDATE` and `BEFORE DELETE` triggers.
 - **Review-Queue Backpressure**: Atomic SQLite subqueries throttle builder claims when unreviewed tasks reach `max_pending_review`.
 - **Intentional Friction Gates**: Blocks self-approval and mandates cryptographic evidence for sensitive tags and paths.
-- **ICM Startup Scaffolding**: Generates `AGENTS.md`, `CONTEXT.md`, and `.stigmerig/rig.json` on initialization, writing `.stigmerig/AGENTS.stigmerig.md` when `AGENTS.md` exists.
+- **ICM Startup Scaffolding and Sync**: Generates `AGENTS.md`, `CONTEXT.md`, and `.stigmerig/rig.json` with sidecar fallback. Verifies and syncs SHA-256 markers via `--check` and `--sync-icm`.
 - **Composite Anti-Self-Approval Gate**: Blocks direct and aliased self-verification across `seat/agent`, `agent@host`, and `role:agent` identifiers.
+- **Non-Blocking Follow-Up Spawning**: Repeatable `--follow-up` flags on `task done` and `task approve` atomically spawn top-level `FU-` backlog tasks.
 - **Rolling Git Worktree Waves**: Executes 3 to 5 tasks per batch in `.worktrees/<ID>` with archetype commit attribution and `--no-ff` merges.
 - **Anti-DMV and Wave Topology Telemetry**: Computes `verify_only_ratio`, `ceremony_ratio`, `review_wait_ratio`, epic `phase_depth`, and Mermaid handoff diagrams.
 - **Brownfield Baseline Ratchets**: Suppresses legacy violations using multiset fingerprints while catching net-new regressions.
 - **Verification Trap Pack**: Catches skipped tests, blanket linter suppressions, and unverified documentation stubs.
+- **Rust Never-Crash Trap Pack**: Enforces `TRAP-RS-003` and `TRAP-RS-004` on production Rust code with lazy inline `#[cfg(test)]` masking.
 - **Normalized Blocker Trap Harvesting**: Deduplicates recurring failure signatures in `.stigmerig/traps.json` and promotes persistent traps at three occurrences.
 - **Tier A and Tier B Schema Interoperability**: Reads flat or nested task files, normalizes event schemas, and isolates `--rig-dir` sandboxes.
 - **Zero Runtime Cloud Dependencies**: Built purely on the Python 3.10+ standard library (`sqlite3`, `argparse`, `hashlib`, `subprocess`).
@@ -163,11 +175,11 @@ StigmeRig enforces operational security and concurrency invariants across all wo
 Install StigmeRig directly from GitHub using pip or uv:
 
 ```bash
-pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.5"
+pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.6"
 ```
 
 ```bash
-uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.5"
+uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.6"
 ```
 
 Alternatively, clone the repository for editable local development:
@@ -196,6 +208,12 @@ stigmerig init
 
 This generates `.stigmerig/rig.json`, initializes SQLite databases, and scaffolds `AGENTS.md` and `CONTEXT.md` onboarding files.
 If `AGENTS.md` already exists, it writes `.stigmerig/AGENTS.stigmerig.md` sidecar instructions to prevent overwriting your existing directives.
+Check bounded `AGENTS.md` SHA-256 markers without SQLite writes, or sync them while preserving surrounding user rules:
+
+```bash
+stigmerig init --check
+stigmerig init --sync-icm
+```
 
 ### 2. Create Tasks
 
@@ -246,6 +264,14 @@ stigmerig task done --id TASK-001 --agent AgentAlpha --verifier AgentBeta --sess
 ```
 
 Attach repeatable `--evidence <path>` flags to bind verification artifacts to the completion event. Each path must resolve inside the repository root. StigmeRig hashes each file in 64 KiB chunks into `task_events.payload` and `audit.db` `payload_hash`.
+
+Capture non-blocking findings during `task approve` or `task done` with repeatable `--follow-up` flags:
+
+```bash
+stigmerig task approve --id TASK-001 --verifier AgentBeta --follow-up "Add edge test coverage"
+```
+
+Each flag atomically spawns a top-level `FU-<ORIGIN>-<SEQ>` `todo` task without blocking parent epic closure.
 
 Verify cryptographic hash-chain integrity:
 
@@ -358,6 +384,9 @@ stigmerig traps scan . --json
 
 Available starter packs include `generic`, `python`, `typescript`, `rust`, `go`, and `verification`.
 The `verification` pack blocks unjustified skipped tests, blanket linter suppressions, and unresolved documentation placeholders.
+The `rust` pack adds `never-crash` rules `TRAP-RS-003` and `TRAP-RS-004`.
+Both rules block `.unwrap()`, `.expect(`, `panic!(`, `todo!(`, and `unimplemented!(`.
+Lazy inline `#[cfg(test)]` masking exempts colocated Rust tests from production rules while keeping `TRAP-VER-001` active.
 Remediations cite native static analyzer rules including `ruff PGH004`, `clippy`, and `eslint-comments`.
 
 For mature repositories, use baseline ratchets to suppress legacy violations:
@@ -388,14 +417,14 @@ Pass `--rig-dir <path>` before any subcommand to target an isolated `.stigmerig`
 
 | Command | Purpose | Key Flags |
 | :--- | :--- | :--- |
-| `stigmerig init` | Initialize SQLite databases, `Task_Board.md`, and ICM files. | `--path <dir>`, `--no-icm` |
+| `stigmerig init` | Initialize SQLite databases, `Task_Board.md`, and check or sync bounded `AGENTS.md` markers. | `--path <dir>`, `--no-icm`, `--check`, `--sync-icm` |
 | `stigmerig task create` | Register a task in `queue.db` and scaffold its Markdown context. | `--id`, `--title`, `--parent`, `--archetype`, `--priority`, `--tags`, `--author` |
 | `stigmerig task list` | Query tasks ordered by priority and creation timestamp. | `--status <todo\|working\|review\|done\|blocked>`, `--parent <id>` |
 | `stigmerig task get` | Inspect full JSON metadata for a single task. | `--id` |
 | `stigmerig task claim` | Acquire an atomic CAS task lease with expiration TTL. | `--id`, `--agent`, `--ttl <seconds>`, `--force-backpressure` |
 | `stigmerig task review` | Submit a working task for review with receipts. | `--id`, `--agent`, `--summary`, `--verification-cmd`, `--diffstat`, `--evidence`, `--model` |
-| `stigmerig task approve` | Approve a reviewed task with an independent verifier. | `--id`, `--verifier`, `--session-id`, `--evidence`, `--model` |
-| `stigmerig task done` | Close a task after independent verification and compute next rail step. | `--id`, `--agent`, `--verifier`, `--session-id`, `--evidence`, `--model`, `--allow-self-approval` |
+| `stigmerig task approve` | Approve a reviewed task with an independent verifier and optional follow-ups. | `--id`, `--verifier`, `--session-id`, `--evidence`, `--model`, `--follow-up` |
+| `stigmerig task done` | Close a task after independent verification, spawn follow-ups, and compute next rail step. | `--id`, `--agent`, `--verifier`, `--session-id`, `--evidence`, `--model`, `--allow-self-approval`, `--follow-up` |
 | `stigmerig task fail` | Mark a task blocked and deduplicate its blocker signature in `traps.json`. | `--id`, `--agent`, `--reason` |
 | `stigmerig audit log` | Append a custom SHA-256 hash-chained entry to `audit.db`. | `--task`, `--action`, `--agent`, `--status`, `--payload` |
 | `stigmerig audit verify` | Validate genesis continuity and SHA-256 digests across `audit_log`. | None |
