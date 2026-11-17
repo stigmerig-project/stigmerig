@@ -74,7 +74,8 @@ def test_write_output_symlinks_rig_containment_and_atomic_write(rig_dir: Path, t
     with monkeypatch.context() as mp:
         mp.delattr(Path, "is_junction", raising=False)
         assert cli.main(["init", "--path", str(tmp_path / "py310_rig"), "--no-icm"]) == 0 and cli.main(["telemetry", "metrics", "--output", str(tmp_path / "py310.md")]) == 0
-        mp.setattr(Path, "is_symlink", lambda self: self == fake_sym)
+        orig_is_symlink = Path.is_symlink
+        mp.setattr(Path, "is_symlink", lambda self: self == fake_sym or orig_is_symlink(self))
         with pytest.raises(ValueError):
             cli._write_output(str(fake_sym), "data", rig_dir)
     monkeypatch.setattr(cli, "_atomic_write_text", lambda p, c: (calls.append(p), real_atomic(p, c))[1])

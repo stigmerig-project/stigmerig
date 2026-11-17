@@ -74,7 +74,8 @@ def test_output_symlink_worktrees_env_and_evidence_guards(rig_dir: Path, tmp_pat
             cli._write_output(str(bo), "x", rig_dir)
         assert all((capsys.readouterr(), cli.main(["--rig-dir", str(rig_dir), "telemetry", *s, "--output", str(bo)]) == 1)[1] for s in (["sequence"], ["metrics"], ["metrics", "--json"]))
     with monkeypatch.context() as mp:
-        mp.setattr(Path, "is_symlink", lambda self: self == sec_f)
+        orig_is_symlink = Path.is_symlink
+        mp.setattr(Path, "is_symlink", lambda self: self == sec_f or orig_is_symlink(self))
         with pytest.raises(ValueError):
             cli._write_output(str(sec_f), "overwrite", rig_dir)
         assert (capsys.readouterr(), cli.main(["--rig-dir", str(rig_dir), "telemetry", "metrics", "--output", str(sec_f)]) == 1)[1]

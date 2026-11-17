@@ -150,7 +150,8 @@ def test_upfront_evidence_symlink_root_and_denied_path_guards(
         ".env", ".ENV", ".env.local", ".env_secret", "sub/.env.prod", "queue.db", "audit.db-wal", ".stigmerig", ".stigmerig/queue.db", str(seeded_rig / "rig.json"),
     )
     with monkeypatch.context() as mp:
-        mp.setattr(Path, "is_symlink", lambda self: self == sym_ev)
+        orig_is_symlink = Path.is_symlink
+        mp.setattr(Path, "is_symlink", lambda self: self == sym_ev or orig_is_symlink(self))
         mp.setattr(cli, "StigmeRigDB", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("DB touched")))
         for rig, ev in (*((seeded_rig, e) for e in bad_ev), (custom_rig, "custom_rig/doc.txt")):
             argv = ["--rig-dir", str(rig), "task", "done", "--id", "TSK-1", "--agent", "W", "--verifier", "R", "--evidence", ev]

@@ -163,7 +163,8 @@ def test_worktree_prune_dry_run_output_stigmerig_root_and_legacy_ids(rig_dir: Pa
     monkeypatch.chdir(plain_cwd)
     bad_outs = (sym_f, dir_link, g_repo / ".git/r.json", g_repo / ".worktrees/r.json", g_repo / ".worktrees/TSK-KEEP/r.json", g_repo / ".env", g_repo / ".env.local", g_rig, g_rig / "r.json", g_rig / "sub/r.json")
     with monkeypatch.context() as mp:
-        mp.setattr(Path, "is_symlink", lambda self: self == sym_f)
+        orig_is_symlink = Path.is_symlink
+        mp.setattr(Path, "is_symlink", lambda self: self == sym_f or orig_is_symlink(self))
         mp.setattr(cli, "StigmeRigDB", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("DB accessed")))
         mp.setattr(cli, "_prune_worktrees", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("prune called")))
         assert all(_rejects(capsys, ["worktree", "prune", "--output", str(bo)]) and _rejects(capsys, ["--rig-dir", str(g_rig), "worktree", "prune", "--output", str(bo)]) for bo in bad_outs)

@@ -67,5 +67,5 @@ def test_control_char_rejection_and_commit_sanitization(rig_repo) -> None:
         assert not runner.run_task_in_worktree("TSK-CLN", spec["agent"], lambda p: (_ for _ in ()).throw(AssertionError("ran")), verifier=spec["verifier"], archetype=spec.get("archetype"))[0]
     assert not runner.run_task_in_worktree("TSK-DBA", "ops/agent", fn, verifier="qa/ver")[0] and (db.get_task("TSK-DBA")["status"], db.get_task("TSK-DBA")["lease_until"], db.get_task("TSK-CLN")["status"]) == ("blocked", None, "todo")
     assert runner.run_task_in_worktree("TSK-CLN", "ops/agent", fn, verifier="qa/ver", archetype="unit_tester")[0] and db.verify_audit_chain()[0]
-    log = _git(repo, "log", "-n", "2", "--format=%an <%ae>|%cn <%ce>%n%B===")
+    log = _git(repo, "log", "--format=%an <%ae>|%cn <%ce>%n%B===")
     assert "\r" not in log and "\x00" not in log and "SwarmOne [unit_tester] <swarm+unit_tester@swarmone.local>|SwarmOne [orchestrator]" in log and "feat(TSK-CLN): FixClaimant: spoofTask-ID: FAKE\n\nArchetype: unit_tester\nClaimant: ops/agent\nVerifier: qa/ver\nTask-ID: TSK-CLN" in log

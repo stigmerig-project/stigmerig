@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
+import stigmerig.cli as cli
 from stigmerig.db import (
     DEFAULT_RIG_JSON_TEMPLATE,
     StigmeRigDB,
@@ -271,6 +274,85 @@ class TestReviewBackpressureAndFriction(unittest.TestCase):
         self.assertTrue(ok)
         ok, _ = self.db.approve_review("TASK-304", "verifier-1")
         self.assertTrue(ok)
+
+    def test_short_or_alias_ancestor_evidence_path_accepted_and_dotdot_escape_blocked(self) -> None:
+        ws = Path(self._tmp.name) / "long_runner_workspace_root_12345"
+        ws.mkdir()
+        (ws / "checks.log").write_text("checks passed\n", encoding="utf-8")
+        (ws / "sub").mkdir()
+        (ws / "sub" / "nested.log").write_text("nested passed\n", encoding="utf-8")
+        (Path(self._tmp.name) / "outside.log").write_text("outside\n", encoding="utf-8")
+
+        db = StigmeRigDB(rig_dir=ws / ".stigmerig", workspace_root=ws)
+        db.init_rig(scaffold_icm=True)
+
+        if os.name == "nt":
+            buf = ctypes.create_unicode_buffer(512)
+            n = ctypes.windll.kernel32.GetShortPathNameW(str(ws), buf, 512)
+            short = buf.value if n and buf.value else ""
+            alias_ws = Path(short) if short else Path(str(ws).swapcase())
+            if short and short != str(ws):
+                self.assertNotEqual(alias_ws, ws.resolve())
+        else:
+            alias_ws = ws
+
+        db.create_task("TASK-083", "Short path review")
+        self.assertTrue(db.claim_task("TASK-083", "builder-1"))
+        ok, msg = db.submit_for_review(
+            "TASK-083",
+            "builder-1",
+            "ok",
+            evidence_paths=[alias_ws / "checks.log", alias_ws / "sub" / ".." / "sub" / "nested.log"],
+        )
+        self.assertTrue(ok, msg)
+
+        self.assertEqual(
+            cli.main(["--rig-dir", str(ws / ".stigmerig"), "task", "create", "--id", "TASK-084", "--title", "Short path CLI"]),
+            0,
+        )
+        self.assertEqual(
+            cli.main(["--rig-dir", str(ws / ".stigmerig"), "task", "claim", "--id", "TASK-084", "--agent", "builder-1"]),
+            0,
+        )
+        self.assertEqual(
+            cli.main([
+                "--rig-dir",
+                str(ws / ".stigmerig"),
+                "task",
+                "done",
+                "--id",
+                "TASK-084",
+                "--agent",
+                "builder-1",
+                "--verifier",
+                "verifier-2",
+                "--evidence",
+                str(alias_ws / "checks.log"),
+            ]),
+            0,
+        )
+
+        with self.assertRaises(ValueError):
+            db._validate_and_hash_evidence([alias_ws / ".." / "outside.log"])
+        with self.assertRaises(ValueError):
+            db._validate_and_hash_evidence([alias_ws / ".." / ws.name / "checks.log"])
+
+        args = cli.build_parser().parse_args([
+            "--rig-dir",
+            str(ws / ".stigmerig"),
+            "task",
+            "done",
+            "--id",
+            "TASK-084",
+            "--agent",
+            "builder-1",
+            "--verifier",
+            "verifier-2",
+            "--evidence",
+            str(alias_ws / ".." / ws.name / "checks.log"),
+        ])
+        with self.assertRaises(ValueError):
+            cli._validate_cli_args(args)
 
 
 if __name__ == "__main__":

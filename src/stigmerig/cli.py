@@ -119,7 +119,15 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
             abs_cand = Path(os.path.abspath(str(cand)))
             if _is_link(cand) or _is_link(abs_cand) or any(_is_link(a) for a in (*cand.parents, *abs_cand.parents) if a not in ws_ancs):
                 raise ValueError(f"--evidence path '{raw_ev}' must not be or traverse a symlink or junction")
-            ev_res, anc_res = cand.resolve(), [a.resolve() for a in cand.parents if a not in ws_ancs]
+            ev_res = cand.resolve()
+            anc_res: list[Path] = []
+            for a in cand.parents:
+                if a in ws_ancs:
+                    continue
+                r = a.resolve()
+                if ".." not in a.parts and r in ws_ancs:
+                    continue
+                anc_res.append(r)
             if ev_res == ws_root or not ev_res.is_relative_to(ws_root) or (".." in ev_p.parts and any(not r.is_relative_to(ws_root) for r in anc_res)):
                 raise ValueError(f"--evidence path '{raw_ev}' escapes workspace root '{ws_root}'")
             sub_ancs = [r for r in anc_res if r != ws_root and r.is_relative_to(ws_root)]

@@ -858,7 +858,14 @@ Add task details and acceptance criteria here.
                 raise ValueError(f"Evidence path must not be or traverse a symlink or junction: {raw_path}")
             try:
                 resolved = cand.resolve()
-                anc_res = [a.resolve() for a in cand.parents if a not in ws_ancs]
+                anc_res: List[Path] = []
+                for a in cand.parents:
+                    if a in ws_ancs:
+                        continue
+                    r = a.resolve()
+                    if ".." not in a.parts and r in ws_ancs:
+                        continue
+                    anc_res.append(r)
             except OSError as exc:
                 raise ValueError(f"Invalid evidence path: {raw_path!r}") from exc
 

@@ -80,7 +80,8 @@ def test_upfront_output_runtime_loop_and_standardized_diagnostics(init_rig_dir: 
     with monkeypatch.context() as mp:
         mp.setattr("builtins.print", lambda *a, **kw: (seen.append(sys.exc_info()[0]), real_print(*a, **kw))[1])
         assert main(["--rig-dir", str(tmp_path / "no_rig"), "task", "list"]) == 1 and seen[-1] is FileNotFoundError
-        mp.setattr(Path, "is_symlink", lambda self: self == sym_f)
+        orig_is_symlink = Path.is_symlink
+        mp.setattr(Path, "is_symlink", lambda self: self == sym_f or orig_is_symlink(self))
         mp.setattr(cli, "StigmeRigDB", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("DB touched")))
         mp.setattr(telem_mod, "TelemetryExporter", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("Telemetry touched")))
         for out_p, exc_cls in ((ex_dir, IsADirectoryError), *((p, ValueError) for p in (f"{tmp_path}/b\no.md", f"{tmp_path}/b\x7fo.md", sym_f, tmp_path / ".git/o.md", tmp_path / ".worktrees/w/o.md", tmp_path / ".env.local", f_anc / "s/o.md", init_rig_dir, init_rig_dir / "o.md"))):
