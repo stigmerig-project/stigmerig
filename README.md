@@ -140,7 +140,7 @@ Heavy Tier 3 automation (`1,000+` external issues, `500+` contributors) stays ou
 - **Multi-Model Referee Routing Policies**: Model cascades belong in external gateway layers. Delegate routing to Plane 3 routers like `LiteLLM` or `Envoy`.
 - **Speculative `50`-PR Merge Batching**: Multi-PR integration batching exceeds the `3-5` task wave ceiling. Run large queues on dedicated CI orchestration runners.
 
-## Security and Concurrency Invariants (v0.1.6)
+## Security and Concurrency Invariants (v0.1.7)
 
 StigmeRig enforces operational security and concurrency invariants across all workflows:
 
@@ -163,6 +163,7 @@ StigmeRig enforces operational security and concurrency invariants across all wo
 - **Non-Blocking Follow-Up Spawning**: Repeatable `--follow-up` flags on `task done` and `task approve` atomically spawn top-level `FU-` backlog tasks.
 - **Rolling Git Worktree Waves**: Executes 3 to 5 tasks per batch in `.worktrees/<ID>` with archetype commit attribution and `--no-ff` merges.
 - **Anti-DMV and Wave Topology Telemetry**: Computes `verify_only_ratio`, `ceremony_ratio`, `review_wait_ratio`, epic `phase_depth`, and Mermaid handoff diagrams.
+- **Config-Driven Model Lineage and Tier Telemetry**: Maps archetype models via `rig.json` `archetype_models`, adds `WaveRunner` `Model:` trailers, and tracks `tier_overprovisioned_alert`.
 - **Brownfield Baseline Ratchets**: Suppresses legacy violations using multiset fingerprints while catching net-new regressions.
 - **Verification Trap Pack**: Catches skipped tests, blanket linter suppressions, and unverified documentation stubs.
 - **Rust Never-Crash Trap Pack**: Enforces `TRAP-RS-003` and `TRAP-RS-004` on production Rust code with lazy inline `#[cfg(test)]` masking.
@@ -175,11 +176,11 @@ StigmeRig enforces operational security and concurrency invariants across all wo
 Install StigmeRig directly from GitHub using pip or uv:
 
 ```bash
-pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.6"
+pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.7"
 ```
 
 ```bash
-uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.6"
+uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.7"
 ```
 
 Alternatively, clone the repository for editable local development:

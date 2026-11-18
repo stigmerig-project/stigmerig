@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from pathlib import Path
-import subprocess, threading, pytest
+import json, subprocess, threading, pytest
 import stigmerig.wave as wave_mod
 from stigmerig.db import StigmeRigDB
 from stigmerig.wave import WaveRunner, WorktreeManager, _validate_wave_specs, get_active_branch
@@ -69,3 +69,67 @@ def test_control_char_rejection_and_commit_sanitization(rig_repo) -> None:
     assert runner.run_task_in_worktree("TSK-CLN", "ops/agent", fn, verifier="qa/ver", archetype="unit_tester")[0] and db.verify_audit_chain()[0]
     log = _git(repo, "log", "--format=%an <%ae>|%cn <%ce>%n%B===")
     assert "\r" not in log and "\x00" not in log and "SwarmOne [unit_tester] <swarm+unit_tester@swarmone.local>|SwarmOne [orchestrator]" in log and "feat(TSK-CLN): FixClaimant: spoofTask-ID: FAKE\n\nArchetype: unit_tester\nClaimant: ops/agent\nVerifier: qa/ver\nTask-ID: TSK-CLN" in log
+
+
+def _completed_payload(db: StigmeRigDB, task_id: str) -> dict:
+    with db.get_queue_conn() as conn:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'completed' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    assert row is not None and row["payload"]
+    return json.loads(row["payload"])
+
+
+def test_model_trailer_and_event_payload_explicit_archetype_and_none(rig_repo, monkeypatch) -> None:
+    monkeypatch.delenv("STIGMERIG_MODEL", raising=False)
+    repo, db, _, runner = rig_repo
+    (db.rig_dir / "rig.json").write_text(json.dumps({"archetype_models": {"unit_tester": "arch-model-1"}}), encoding="utf-8")
+    for tid in ("TSK-EXP", "TSK-ARCH", "TSK-NONE"):
+        db.create_task(tid, f"Model {tid}", author="Arch")
+
+    ok_exp, _ = runner.run_task_in_worktree("TSK-EXP", "A1", lambda p: (p / "exp.txt").write_text("1\n", encoding="utf-8") is not None, verifier="V1", archetype="unit_tester", model_id="explicit-model-9")
+    ok_arch, _ = runner.run_task_in_worktree("TSK-ARCH", "A1", lambda p: (p / "arch.txt").write_text("2\n", encoding="utf-8") is not None, verifier="V1", archetype="unit_tester")
+    ok_none, _ = runner.run_task_in_worktree("TSK-NONE", "A1", lambda p: (p / "none.txt").write_text("3\n", encoding="utf-8") is not None, verifier="V1", archetype="diff_synthesizer")
+    assert ok_exp and ok_arch and ok_none
+
+    for tid, expected_model in (("TSK-EXP", "explicit-model-9"), ("TSK-ARCH", "arch-model-1"), ("TSK-NONE", None)):
+        msg = _git(repo, "log", "-n", "1", "--grep", f"Task-ID: {tid}", "--format=%B")
+        model_lines = [line for line in msg.splitlines() if line.startswith("Model:")]
+        payload = _completed_payload(db, tid)
+        if expected_model is None:
+            assert model_lines == [] and "model_id" not in payload
+        else:
+            assert model_lines == [f"Model: {expected_model}"] and payload.get("model_id") == expected_model
+
+
+def test_run_wave_concurrent_tasks_isolate_model_trailers(rig_repo, monkeypatch) -> None:
+    monkeypatch.delenv("STIGMERIG_MODEL", raising=False)
+    repo, db, _, runner = rig_repo
+    (db.rig_dir / "rig.json").write_text(json.dumps({"archetype_models": {"unit_tester": "arch-wave-model"}}), encoding="utf-8")
+    for tid in ("TSK-W1", "TSK-W2", "TSK-W3"):
+        db.create_task(tid, f"Wave {tid}", author="Arch")
+
+    barrier = threading.Barrier(3, timeout=10)
+
+    def _make_action(name: str):
+        def _act(wt: Path) -> bool:
+            barrier.wait()
+            (wt / name).write_text(f"{name}\n", encoding="utf-8")
+            return True
+        return _act
+
+    results = runner.run_wave(
+        [
+            {"task_id": "TSK-W1", "agent": "A1", "verifier": "V1", "archetype": "diff_synthesizer", "model_id": "model-alpha", "action": _make_action("w1.txt")},
+            {"task_id": "TSK-W2", "agent": "A2", "verifier": "V2", "archetype": "diff_synthesizer", "model_id": "model-beta", "action": _make_action("w2.txt")},
+            {"task_id": "TSK-W3", "agent": "A3", "verifier": "V3", "archetype": "unit_tester", "action": _make_action("w3.txt")},
+        ],
+        max_concurrency=3,
+    )
+    assert all(ok for ok, _ in results.values())
+
+    for tid, expected_model in (("TSK-W1", "model-alpha"), ("TSK-W2", "model-beta"), ("TSK-W3", "arch-wave-model")):
+        msg = _git(repo, "log", "-n", "1", "--grep", f"Task-ID: {tid}", "--format=%B")
+        model_lines = [line for line in msg.splitlines() if line.startswith("Model:")]
+        assert model_lines == [f"Model: {expected_model}"] and _completed_payload(db, tid).get("model_id") == expected_model

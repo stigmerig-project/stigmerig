@@ -1,6 +1,7 @@
 """Hermetic hardening tests for TelemetryExporter payloads, timestamps, and table escaping."""
 import datetime, json, re
 from pathlib import Path
+import pytest
 from stigmerig.db import StigmeRigDB
 from stigmerig.telemetry import TelemetryExporter, parse_iso
 
@@ -57,3 +58,79 @@ def test_metrics_markdown_escapes_pipes_and_newlines_in_traps(tmp_path: Path) ->
     md = TelemetryExporter(db).generate_metrics_markdown()
     trap_rows = [line for line in md.splitlines() if line.startswith("| `TRAP-")]
     assert "\r" not in md and len(trap_rows) == 2 and all(r"\|" in row and len(re.findall(r"(?<!\\)\|", row)) == 5 for row in trap_rows)
+
+
+def test_resolve_task_model_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = StigmeRigDB(rig_dir=tmp_path / ".stigmerig")
+    db.init_rig(scaffold_icm=False)
+    monkeypatch.delenv("STIGMERIG_MODEL", raising=False)
+    assert db.resolve_task_model("prose_auditor") is None
+
+    rig_cfg = {}
+    rig_cfg["archetype_models"] = {"prose_auditor": "gemini-flash-lite"}
+    (db.rig_dir / "rig.json").write_text(json.dumps(rig_cfg), encoding="utf-8")
+    assert db.resolve_task_model("PROSE_AUDITOR") == "gemini-flash-lite"
+    assert db.resolve_task_model("diff_synthesizer") is None
+
+    monkeypatch.setenv("STIGMERIG_MODEL", "claude-sonnet-4.6")
+    assert db.resolve_task_model("prose_auditor") == "claude-sonnet-4.6"
+    assert db.resolve_task_model(None) == "claude-sonnet-4.6"
+    assert db.resolve_task_model("prose_auditor", explicit_model="gpt-5-mini") == "gpt-5-mini"
+
+
+def test_compute_topology_and_dmv_tier_overprovisioned_alerts(tmp_path: Path) -> None:
+    db = StigmeRigDB(rig_dir=tmp_path / ".stigmerig")
+    db.init_rig(scaffold_icm=False)
+    tasks = [
+        ("TSK-PA", "Audit", "prose_auditor"),
+        ("TSK-UT", "Test", "unit_tester"),
+        ("TSK-DS", "Synth", "diff_synthesizer"),
+    ]
+    evs = [
+        ("TSK-PA", "claimed", json.dumps({"model_id": "flash_lite"}), "2026-03-01T10:00:00Z"),
+        ("TSK-UT", "claimed", json.dumps({"model_id": "flash_lite"}), "2026-03-01T10:01:00Z"),
+        ("TSK-DS", "claimed", json.dumps({"model_id": "claude-opus-5.5"}), "2026-03-01T10:02:00Z"),
+    ]
+    with db.get_queue_conn() as conn:
+        conn.executemany(
+            "INSERT INTO tasks (id, title, status, priority, created_at, updated_at, archetype) VALUES (?, ?, 'done', 100, '2026-03-01T10:00:00Z', '2026-03-01T10:05:00Z', ?)",
+            tasks,
+        )
+        conn.executemany(
+            "INSERT INTO task_events (task_id, event_type, agent, payload, timestamp) VALUES (?, ?, 'WorkerA', ?, ?)",
+            evs,
+        )
+        conn.commit()
+
+    exporter = TelemetryExporter(db)
+    gov_non_frontier = exporter.compute_topology_and_dmv_metrics()
+    assert gov_non_frontier["tier_overprovisioned_alert"] is False
+    assert gov_non_frontier["tier_overprovisioned_count"] == 0
+    assert gov_non_frontier["tier_overprovisioned_tasks"] == []
+
+    with db.get_queue_conn() as conn:
+        conn.execute(
+            "INSERT INTO task_events (task_id, event_type, agent, payload, timestamp) VALUES ('TSK-PA', 'completed', 'WorkerA', ?, '2026-03-01T10:03:00Z')",
+            (json.dumps({"model_id": "gemini-4-carbon"}),),
+        )
+        conn.commit()
+
+    gov_frontier = exporter.compute_topology_and_dmv_metrics()
+    assert gov_frontier["tier_overprovisioned_alert"] is True
+    assert gov_frontier["tier_overprovisioned_count"] == 1
+    assert gov_frontier["tier_overprovisioned_tasks"] == ["TSK-PA"]
+
+    rig_cfg = {}
+    rig_cfg["frontier_model_tokens"] = ["custom-ultra"]
+    (db.rig_dir / "rig.json").write_text(json.dumps(rig_cfg), encoding="utf-8")
+    with db.get_queue_conn() as conn:
+        conn.execute(
+            "INSERT INTO task_events (task_id, event_type, agent, payload, timestamp) VALUES ('TSK-UT', 'completed', 'WorkerA', ?, '2026-03-01T10:04:00Z')",
+            (json.dumps({"model_id": "my-custom-ultra-v2"}),),
+        )
+        conn.commit()
+
+    gov_custom = exporter.compute_topology_and_dmv_metrics()
+    assert gov_custom["tier_overprovisioned_alert"] is True
+    assert gov_custom["tier_overprovisioned_count"] == 1
+    assert gov_custom["tier_overprovisioned_tasks"] == ["TSK-UT"]

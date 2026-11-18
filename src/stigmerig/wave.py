@@ -337,7 +337,7 @@ def _validate_wave_specs(task_specs: Any, has_worktree_mgr: bool) -> List[Dict[s
         tid, agent = spec.get("task_id"), spec.get("agent")
         if not isinstance(tid, str) or not TASK_ID_PATTERN.fullmatch(tid):
             raise ValueError(f"Task spec at index {idx} has missing or invalid task_id: {tid!r}")
-        if _invalid_meta(agent, spec.get("verifier"), spec.get("archetype")):
+        if _invalid_meta(agent, spec.get("verifier"), spec.get("archetype")) or _invalid_meta("ok", spec.get("model_id")):
             raise ValueError(f"Task spec at index {idx} has invalid or control-character metadata")
         if not isinstance(spec.get("allow_self_approval", False), bool):
             raise ValueError(f"Task spec at index {idx} has non-boolean allow_self_approval")
@@ -389,14 +389,17 @@ class WaveRunner:
         archetype: Optional[str] = None,
         allow_self_approval: bool = False,
         evidence_paths: Optional[Sequence[str | Path]] = None,
+        model_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Execute a single task inside an isolated worktree."""
         if not isinstance(task_id, str) or not TASK_ID_PATTERN.fullmatch(task_id):
             return False, f"Invalid task_id: {task_id!r}"
         if not isinstance(allow_self_approval, bool):
             return False, "allow_self_approval must be a boolean"
-        if _invalid_meta(agent, verifier, archetype):
-            return False, "Invalid or control-character metadata in agent, verifier, or archetype"
+        if _invalid_meta(agent, verifier, archetype) or (
+            model_id is not None and (not isinstance(model_id, str) or not model_id.strip() or _invalid_meta("ok", model_id))
+        ):
+            return False, "Invalid or control-character metadata in agent, verifier, archetype, or model_id"
         if not allow_self_approval:
             clean_verifier = str(verifier).strip() if verifier is not None else ""
             if not clean_verifier or _is_self_approval(agent, clean_verifier):
@@ -420,6 +423,7 @@ class WaveRunner:
         try:
             if (not use_arg_arch and db_arch is not None and _invalid_meta("ok", db_arch)) or _invalid_meta("ok", arch):
                 raise ValueError("Invalid or control-character archetype")
+            effective_model = self.db.resolve_task_model(arch, explicit_model=model_id)
             if self.worktree_mgr:
                 with self.worktree_mgr._lock:
                     clean_id, _ = self.worktree_mgr._resolve_worktree_target(task_id)
@@ -528,6 +532,8 @@ class WaveRunner:
                             f"Verifier: {(verifier or '').strip() or 'independent'}\n"
                             f"Task-ID: {task_id}\n"
                         )
+                        if effective_model is not None:
+                            commit_msg += f"Model: {effective_model}\n"
                         subprocess.run(
                             ["git", "commit", "--no-gpg-sign", "-m", commit_msg],
                             cwd=str(worktree_path),
@@ -549,6 +555,7 @@ class WaveRunner:
                     allow_self_approval=allow_self_approval,
                     evidence_paths=evidence_paths,
                     touched_paths=touched_paths,
+                    model_id=effective_model,
                 )
         except Exception as exc:
             err_msg = f"{exc}: {d}" if isinstance(exc, subprocess.CalledProcessError) and (d := _proc_detail(exc)) and d not in str(exc) else str(exc)
@@ -590,6 +597,7 @@ class WaveRunner:
                     archetype=arch,
                     allow_self_approval=allow_self_approval,
                     evidence_paths=spec.get("evidence_paths"),
+                    model_id=spec.get("model_id"),
                 )
                 return t_id, (ok, msg)
 

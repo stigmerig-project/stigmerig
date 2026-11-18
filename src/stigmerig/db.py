@@ -59,6 +59,7 @@ VERIFY_ONLY_ARCHETYPES: frozenset[str] = frozenset({
     "policy_gatekeeper",
     "topology_reader",
 })
+DEFAULT_FRONTIER_MODEL_TOKENS: Tuple[str, ...] = ("opus", "carbon", "argon", "tier-pro", "gpt-5-pro", "o3-pro")
 TASK_ID_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _TRAP_STOP_WORDS: frozenset[str] = frozenset({
     "with", "from", "that", "this", "have", "been", "were", "when", "what",
@@ -92,7 +93,7 @@ _AGENTS_MANAGED_BODY = """## Autonomous Operation Invariants
 
 1. Query available tasks via `stigmerig task list --status todo`.
 2. Claim a task with lease TTL via `stigmerig task claim --id <id> --agent <agent>`.
-3. Scan traps via `stigmerig traps scan` and complete verification via `stigmerig task done --id <id> --agent <agent> --verifier <verifier> --evidence <path>`."""
+3. Scan traps via `stigmerig traps scan` and complete verification via `stigmerig task done --id <id> --agent <agent> --verifier <verifier> --evidence <path>` (pass `--model <model>` or `STIGMERIG_MODEL` for lineage)."""
 
 
 def _compute_icm_sha256(body: str) -> str:
@@ -422,6 +423,8 @@ class StigmeRigDB:
             "max_pending_review": None,
             "high_friction_tags": frozenset(),
             "high_friction_globs": (),
+            "archetype_models": {},
+            "frontier_model_tokens": DEFAULT_FRONTIER_MODEL_TOKENS,
         }
         rig_json = self.rig_dir / "rig.json"
         if not rig_json.is_file():
@@ -453,7 +456,40 @@ class StigmeRigDB:
                 raise ValueError("Invalid high_friction_globs in rig.json: must be a list of non-empty strings")
             defaults["high_friction_globs"] = tuple(g.strip().replace("\\", "/") for g in raw_globs)
 
+        raw_models = raw.get("archetype_models")
+        if raw_models is not None:
+            if not isinstance(raw_models, dict):
+                raise ValueError("Invalid archetype_models in rig.json: must be an object")
+            norm_models: Dict[str, str] = {}
+            for k, v in raw_models.items():
+                if not isinstance(k, str) or not k.strip() or not k.isprintable():
+                    raise ValueError("Invalid archetype_models key in rig.json")
+                norm_models[k.strip().lower()] = _validate_model_string(v, "archetype_models value")
+            defaults["archetype_models"] = norm_models
+
+        raw_tokens = raw.get("frontier_model_tokens")
+        if raw_tokens is not None:
+            if not isinstance(raw_tokens, list) or any(
+                not isinstance(t, str) or not t.strip() or not t.isprintable() for t in raw_tokens
+            ):
+                raise ValueError("Invalid frontier_model_tokens in rig.json: must be a list of non-empty strings")
+            defaults["frontier_model_tokens"] = tuple(t.strip().lower() for t in raw_tokens)
+
         return defaults
+
+    def resolve_task_model(
+        self,
+        archetype_or_seat: Optional[str],
+        explicit_model: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve explicit model_id or fall back to rig.json archetype_models mapping."""
+        resolved = resolve_model_id(explicit_model)
+        if resolved is not None:
+            return resolved
+        key = (archetype_or_seat or "").strip().lower()
+        if not key:
+            return None
+        return self._load_rig_config()["archetype_models"].get(key)
 
     @staticmethod
     def _validate_touched_paths(touched_paths: Optional[Sequence[str | Path]]) -> Tuple[str, ...]:
@@ -1502,6 +1538,8 @@ Add task details and acceptance criteria here.
             )
 
         seat = derive_seat(agent)
+        if resolved_model is None:
+            resolved_model = self.resolve_task_model(task.get("archetype"))
         event_payload: Dict[str, Any] = {
             "verifier": verifier,
             "implementer": implementer,
@@ -1588,6 +1626,8 @@ Add task details and acceptance criteria here.
         if evidence_paths is not None:
             evidence_records = self._validate_and_hash_evidence(evidence_paths)
 
+        if resolved_model is None:
+            resolved_model = self.resolve_task_model(task.get("archetype"))
         event_payload: Dict[str, Any] = {
             "summary": summary.strip(),
             "implementer": task.get("claimed_by") or agent,
@@ -1756,10 +1796,13 @@ Add task details and acceptance criteria here.
 
         now = utc_now_iso()
         version = task.get("version", 0)
+        verifier_seat = derive_seat(verifier)
+        if resolved_model is None:
+            resolved_model = self.resolve_task_model(verifier_seat)
         event_payload: Dict[str, Any] = {
             "verifier": verifier,
             "implementer": latest_implementer or verifier,
-            "seat": derive_seat(verifier),
+            "seat": verifier_seat,
             "session_id": session_id,
         }
         if resolved_model is not None:

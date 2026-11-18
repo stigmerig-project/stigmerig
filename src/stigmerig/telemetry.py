@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from stigmerig.db import StigmeRigDB, _escape_md_cell, _is_self_approval
+from stigmerig.db import DEFAULT_FRONTIER_MODEL_TOKENS, StigmeRigDB, _escape_md_cell, _is_self_approval
 
 
 VERIFY_ONLY_ARCHETYPES: frozenset[str] = frozenset({
@@ -373,16 +373,27 @@ class TelemetryExporter:
             else 0.0
         )
 
+        frontier_tokens = self.db._load_rig_config().get("frontier_model_tokens") or DEFAULT_FRONTIER_MODEL_TOKENS
+        task_arch_map = {t["id"]: str(t.get("archetype") or "").strip().lower() for t in leaf_tasks}
         leaf_ids = {t["id"] for t in leaf_tasks}
         claimants_by_task: Dict[str, set[str]] = {}
         blocked_leaf_ids: set[str] = set()
         force_claimed_leaf_ids: set[str] = set()
         verified_completed_ids: set[str] = set()
+        over_ids: set[str] = set()
         for ev in events:
             tid = str(ev.get("task_id") or "").strip()
             if not tid or tid not in leaf_ids:
                 continue
             ev_type = ev.get("event_type")
+            if ev_type in ("claimed", "review", "review_submitted", "completed"):
+                payload_d = _parse_payload_dict(ev.get("payload"))
+                raw_m = payload_d.get("model_id") or ev.get("model_id")
+                if raw_m and str(raw_m).strip():
+                    seat_val = str(payload_d.get("seat") or ev.get("seat") or "").strip().lower()
+                    eff_arch = seat_val if seat_val in verify_only_arch else task_arch_map.get(tid, seat_val)
+                    if eff_arch in verify_only_arch and any(str(tok).lower() in str(raw_m).lower() for tok in frontier_tokens):
+                        over_ids.add(tid)
             if ev_type == "claimed":
                 actor = str(ev.get("agent") or "").strip().lower()
                 if actor:
@@ -555,6 +566,9 @@ class TelemetryExporter:
             "review_wait_ratio": review_wait_ratio,
             "review_bottleneck_alert": review_bottleneck_alert,
             "unverified_completion_rate": unverified_completion_rate,
+            "tier_overprovisioned_count": len(over_ids),
+            "tier_overprovisioned_tasks": sorted(over_ids),
+            "tier_overprovisioned_alert": bool(over_ids),
             "epics": epics_summary,
             "blocked_reasons": {
                 "by_reason": reason_counts,
@@ -609,6 +623,7 @@ class TelemetryExporter:
             f"- **Review Wait Ratio (`review_wait_ratio`)**: {gov['review_wait_ratio']:.4f}",
             f"- **Unverified Completion Rate (`unverified_completion_rate`)**: {gov['unverified_completion_rate']:.4f}",
             f"- **Recorded Traps**: {gov['blocked_reasons']['total_traps']} total, {len(gov['blocked_reasons']['recurring_candidates'])} recurring candidates",
+            f"- **Tier Over-Provisioned Verifiers (`tier_overprovisioned_count`)**: {gov['tier_overprovisioned_count']} (`tier_overprovisioned_alert`: `{gov['tier_overprovisioned_alert']}`)",
         ])
 
         if gov["epics"]:
