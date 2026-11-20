@@ -397,6 +397,14 @@ stigmerig traps scan . --write-baseline .stigmerig/traps-baseline.json
 stigmerig traps scan . --baseline .stigmerig/traps-baseline.json
 ```
 
+Check expiring temporary annotations (`@remove-when`) and stale tracked files against configured runtime floors:
+
+```bash
+stigmerig traps freshness . --targets-json targets.json --stale-days 180 --fail-on-expired --json
+```
+
+`traps freshness` leaves `traps scan` baseline fingerprints unchanged. Pass `--fail-on-expired` to exit `1` only on expired annotations (`TRAP-EVG-001`).
+
 The baseline stores multiset counts per relative path, trap identifier, and snippet hash.
 Scans pass when existing violations match baseline counts and fail on net-new infractions.
 
@@ -425,14 +433,14 @@ Pass `--rig-dir <path>` before any subcommand to target an isolated `.stigmerig`
 | `stigmerig task claim` | Acquire an atomic CAS task lease with expiration TTL. | `--id`, `--agent`, `--ttl <seconds>`, `--force-backpressure` |
 | `stigmerig task review` | Submit a working task for review with receipts. | `--id`, `--agent`, `--summary`, `--verification-cmd`, `--diffstat`, `--evidence`, `--model` |
 | `stigmerig task approve` | Approve a reviewed task with an independent verifier and optional follow-ups. | `--id`, `--verifier`, `--session-id`, `--evidence`, `--model`, `--follow-up` |
-| `stigmerig task done` | Close a task after independent verification, spawn follow-ups, and compute next rail step. | `--id`, `--agent`, `--verifier`, `--session-id`, `--evidence`, `--model`, `--allow-self-approval`, `--follow-up` |
+| `stigmerig task done` | Close a task after independent verification, spawn follow-ups, record advisory diff metrics, and compute next rail step. | `--id`, `--agent`, `--verifier`, `--session-id`, `--evidence`, `--model`, `--diffstat`, `--allow-self-approval`, `--follow-up` |
 | `stigmerig task fail` | Mark a task blocked and deduplicate its blocker signature in `traps.json`. | `--id`, `--agent`, `--reason` |
 | `stigmerig audit log` | Append a custom SHA-256 hash-chained entry to `audit.db`. | `--task`, `--action`, `--agent`, `--status`, `--payload` |
 | `stigmerig audit verify` | Validate genesis continuity and SHA-256 digests across `audit_log`. | None |
 | `stigmerig board sync` | Regenerate `<rig_dir>/Task_Board.md` from `queue.db`. | None |
 | `stigmerig telemetry sequence` | Emit a Mermaid sequence diagram of recorded agent handoffs. | `--task <id>`, `--output <file>` |
-| `stigmerig telemetry metrics` | Export task durations, Anti-DMV ratios, wave shapes, and recurring traps. | `--json`, `--output <file>` |
-| `stigmerig traps` | Seed, register, promote, dismiss, verify, and scan polyglot trap invariants. | `scan`, `verify`, `seed`, `register`, `promote`, `dismiss`, `--registry`, `--baseline`, `--write-baseline`, `--pack`, `--json` |
+| `stigmerig telemetry metrics` | Export task durations, Anti-DMV ratios, wave shapes, subtractive `diff_metrics`, and recurring traps. | `--json`, `--output <file>` |
+| `stigmerig traps` | Seed, register, promote, dismiss, verify, scan traps, and check annotation freshness. | `scan`, `freshness`, `verify`, `seed`, `register`, `promote`, `dismiss`, `--registry`, `--baseline`, `--write-baseline`, `--targets-json`, `--stale-days`, `--fail-on-expired`, `--pack`, `--json` |
 
 Environment variables configure default runtime resolution:
 

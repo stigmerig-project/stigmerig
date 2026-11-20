@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 from contextlib import contextmanager
 import datetime
 from functools import lru_cache
@@ -13,6 +14,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -677,6 +679,567 @@ def _glob_matches(
                 return True
 
     return False
+
+
+TRAP_EVG_001_REMEDIATION: str = (
+    "Remove expired compatibility shim or advance its remove-when target condition."
+)
+
+_STABILITY_RE = re.compile(
+    r"\x40stability:\s*(experimental|evolving|stable|deprecated)\b",
+    re.IGNORECASE,
+)
+_REMOVE_WHEN_RE = re.compile(
+    r"\x40remove-when:\s*([^\s*/;,]+)",
+    re.IGNORECASE,
+)
+_DATE_COND_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_SEMVER_COND_RE = re.compile(r"([A-Za-z0-9_.-]+)>=([^\s]+)")
+
+
+def _parse_version_tuple(ver: str) -> Tuple[int, ...]:
+    """Parse a version string (with optional leading v/V) into an int tuple."""
+    if not isinstance(ver, str) or not ver.strip():
+        raise ValueError(f"Invalid version string: {ver!r}")
+    cleaned = ver.strip()
+    if cleaned[0] in ("v", "V"):
+        cleaned = cleaned[1:]
+    if not cleaned:
+        raise ValueError(f"Invalid version string: {ver!r}")
+
+    segments = cleaned.split(".")
+    if not segments or not re.fullmatch(r"\d+", segments[0]):
+        raise ValueError(f"Invalid version string: {ver!r}")
+
+    parts: List[int] = []
+    for seg in segments:
+        m = re.match(r"^(\d+)", seg)
+        if m is None:
+            raise ValueError(f"Invalid version segment {seg!r} in {ver!r}")
+        parts.append(int(m.group(1)))
+    return tuple(parts)
+
+
+def _find_closing_quote(line: str, start: int, quote: str) -> int:
+    """Return index right after closing single-line quote, or -1 if unclosed."""
+    n = len(line)
+    idx = start
+    while idx < n:
+        ch = line[idx]
+        if ch == "\\":
+            idx += 2
+            continue
+        if ch == quote:
+            return idx + 1
+        idx += 1
+    return -1
+
+
+def _find_closing_triple(line: str, start: int, triple: str) -> int:
+    """Return index right after closing triple quote on line, or -1 if unclosed."""
+    n = len(line)
+    idx = start
+    while idx < n:
+        if line[idx] == "\\":
+            idx += 2
+            continue
+        if line.startswith(triple, idx):
+            return idx + 3
+        idx += 1
+    return -1
+
+
+def _scan_line_comments(
+    line: str,
+    *,
+    in_block: bool,
+    in_triple: Optional[str],
+    is_python: bool,
+) -> Tuple[List[Tuple[str, str]], bool, Optional[str], bool]:
+    """Extract (kind, text) comment segments from a single line while tracking multiline state."""
+    segments: List[Tuple[str, str]] = []
+    has_code = False
+    n = len(line)
+    idx = 0
+
+    while idx < n:
+        if in_triple is not None:
+            has_code = True
+            end_triple = _find_closing_triple(line, idx, in_triple)
+            if end_triple == -1:
+                break
+            in_triple = None
+            idx = end_triple
+            continue
+
+        if in_block:
+            end_block = line.find("*/", idx)
+            if end_block == -1:
+                segments.append(("/*", line[idx:]))
+                break
+            segments.append(("/*", line[idx:end_block]))
+            in_block = False
+            idx = end_block + 2
+            continue
+
+        if is_python and (line.startswith('"""', idx) or line.startswith("'''", idx)):
+            has_code = True
+            triple = line[idx : idx + 3]
+            end_triple = _find_closing_triple(line, idx + 3, triple)
+            if end_triple == -1:
+                in_triple = triple
+                break
+            idx = end_triple
+            continue
+
+        ch = line[idx]
+        if ch in ('"', "'", "`"):
+            has_code = True
+            end_q = _find_closing_quote(line, idx + 1, ch)
+            if end_q != -1:
+                idx = end_q
+                continue
+            idx += 1
+            continue
+
+        if line.startswith("/*", idx):
+            end_block = line.find("*/", idx + 2)
+            if end_block == -1:
+                segments.append(("/*", line[idx + 2 :]))
+                in_block = True
+                break
+            segments.append(("/*", line[idx + 2 : end_block]))
+            idx = end_block + 2
+            continue
+
+        if ch == "#":
+            segments.append(("#", line[idx + 1 :]))
+            break
+
+        if line.startswith("//", idx) or line.startswith("--", idx):
+            segments.append((line[idx : idx + 2], line[idx + 2 :]))
+            break
+
+        if not ch.isspace():
+            has_code = True
+        idx += 1
+
+    return segments, in_block, in_triple, has_code
+
+
+def scan_annotations_in_text(
+    text: str,
+    rel_path: str,
+    platform_targets: Mapping[str, str],
+    today_iso: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Scan comment segments for \x40stability and \x40remove-when annotations."""
+    expired_annotations: List[Dict[str, Any]] = []
+    deprecated_unscheduled: List[Dict[str, Any]] = []
+
+    norm_targets: Dict[str, str] = {
+        str(k).strip().lower(): str(v).strip()
+        for k, v in platform_targets.items()
+    }
+    is_python = rel_path.lower().endswith((".py", ".pyi"))
+    in_block = False
+    in_triple: Optional[str] = None
+    run_kind: Optional[str] = None
+    run_deprecated: List[Dict[str, Any]] = []
+    run_has_remove_when = False
+
+    def _flush_run() -> None:
+        nonlocal run_kind, run_deprecated, run_has_remove_when
+        if run_deprecated and not run_has_remove_when:
+            deprecated_unscheduled.extend(run_deprecated)
+        run_kind = None
+        run_deprecated = []
+        run_has_remove_when = False
+
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        was_in_block = in_block
+        segments, in_block, in_triple, has_code = _scan_line_comments(
+            line,
+            in_block=in_block,
+            in_triple=in_triple,
+            is_python=is_python,
+        )
+        if not segments and not was_in_block:
+            _flush_run()
+            continue
+
+        if has_code and not was_in_block:
+            _flush_run()
+
+        snippet = line.strip()[:160]
+        for kind, seg in segments:
+            if run_kind is not None and (kind != run_kind or (kind == "/*" and not was_in_block)):
+                _flush_run()
+            run_kind = kind
+            for m_stab in _STABILITY_RE.finditer(seg):
+                if m_stab.group(1).lower() == "deprecated":
+                    run_deprecated.append(
+                        {
+                            "file": rel_path,
+                            "line": lineno,
+                            "stability": "deprecated",
+                            "snippet": snippet,
+                        }
+                    )
+            if _REMOVE_WHEN_RE.search(seg) is not None:
+                run_has_remove_when = True
+
+            for m_rw in _REMOVE_WHEN_RE.finditer(seg):
+                cond_raw = m_rw.group(1)
+                is_expired = False
+                if _DATE_COND_RE.fullmatch(cond_raw):
+                    try:
+                        datetime.date.fromisoformat(cond_raw)
+                    except ValueError:
+                        continue
+                    is_expired = today_iso >= cond_raw
+                else:
+                    m_ver = _SEMVER_COND_RE.fullmatch(cond_raw)
+                    if m_ver is not None:
+                        runtime = m_ver.group(1).lower()
+                        semver = m_ver.group(2)
+                        if runtime in norm_targets:
+                            try:
+                                is_expired = (
+                                    _parse_version_tuple(norm_targets[runtime])
+                                    >= _parse_version_tuple(semver)
+                                )
+                            except ValueError:
+                                continue
+                if is_expired:
+                    expired_annotations.append(
+                        {
+                            "trap_id": "TRAP-EVG-001",
+                            "title": "Expired \x40remove-when annotation",
+                            "domain": "evergreen",
+                            "file": rel_path,
+                            "line": lineno,
+                            "forbidden": cond_raw,
+                            "snippet": snippet,
+                            "remediation": TRAP_EVG_001_REMEDIATION,
+                        }
+                    )
+
+        if was_in_block and not in_block:
+            _flush_run()
+
+    _flush_run()
+    return expired_annotations, deprecated_unscheduled
+
+
+def collect_recently_touched_paths(repo_root: Path, stale_days: int) -> Optional[set[str]]:
+    """Return POSIX relative paths touched in git history within stale_days, or None if unavailable."""
+    if isinstance(stale_days, bool) or not isinstance(stale_days, int) or stale_days < 1:
+        raise ValueError("stale_days must be a positive integer")
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "log",
+                "--no-renames",
+                f"--since={stale_days}.days",
+                "--format=__COMMIT__%ct",
+                "--name-only",
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+
+    touched: set[str] = set()
+    for raw_line in (proc.stdout or "").splitlines():
+        entry = raw_line.strip()
+        if not entry or entry.startswith("__COMMIT__"):
+            continue
+        norm = entry.replace("\\", "/")
+        while norm.startswith("./"):
+            norm = norm[2:]
+        if norm:
+            touched.add(norm)
+    return touched
+
+
+def _apply_freshness_mapping(
+    payload: Mapping[str, Any],
+    source_desc: str,
+    platform_targets: Dict[str, str],
+    resolved_days: int,
+    protected_globs: Tuple[str, ...],
+    *,
+    allow_flat_targets: bool = False,
+) -> Tuple[int, Tuple[str, ...]]:
+    has_structured_keys = "platform_targets" in payload or "freshness" in payload
+    if allow_flat_targets and not has_structured_keys and payload:
+        for k, v in payload.items():
+            if not isinstance(k, str) or not k.strip() or not isinstance(v, str) or not v.strip():
+                raise ValueError(f"Invalid platform target entry in {source_desc}: {k!r}")
+            platform_targets[k.strip().lower()] = v.strip()
+        return resolved_days, protected_globs
+
+    if "platform_targets" in payload and payload["platform_targets"] is not None:
+        raw_targets = payload["platform_targets"]
+        if not isinstance(raw_targets, Mapping):
+            raise ValueError(f"Invalid 'platform_targets' in {source_desc}: expected object")
+        for k, v in raw_targets.items():
+            if not isinstance(k, str) or not k.strip() or not isinstance(v, str) or not v.strip():
+                raise ValueError(f"Invalid platform target entry in {source_desc}: {k!r}")
+            platform_targets[k.strip().lower()] = v.strip()
+
+    if "freshness" in payload and payload["freshness"] is not None:
+        raw_fresh = payload["freshness"]
+        if not isinstance(raw_fresh, Mapping):
+            raise ValueError(f"Invalid 'freshness' in {source_desc}: expected object")
+        cand_days = raw_fresh.get("stale_threshold_days")
+        if cand_days is None:
+            cand_days = raw_fresh.get("stale_days")
+        if cand_days is not None:
+            if isinstance(cand_days, bool) or not isinstance(cand_days, int) or cand_days < 1:
+                raise ValueError(
+                    f"Invalid 'stale_threshold_days' in {source_desc}: expected positive integer"
+                )
+            resolved_days = cand_days
+        if "protected_globs" in raw_fresh and raw_fresh["protected_globs"] is not None:
+            raw_globs = raw_fresh["protected_globs"]
+            if not isinstance(raw_globs, (list, tuple)) or any(
+                not isinstance(g, str) or not g.strip() for g in raw_globs
+            ):
+                raise ValueError(
+                    f"Invalid 'protected_globs' in {source_desc}: expected list of non-empty strings"
+                )
+            protected_globs = tuple(g.strip().replace("\\", "/") for g in raw_globs)
+
+    return resolved_days, protected_globs
+
+
+def _resolve_freshness_config(
+    rig_dir: Optional[Path],
+    targets_json: Optional[Path],
+    stale_days: Optional[int],
+) -> Tuple[Dict[str, str], int, Tuple[str, ...]]:
+    platform_targets: Dict[str, str] = {}
+    resolved_days = 180
+    protected_globs: Tuple[str, ...] = ("**/migrations/**", "**/contracts/**")
+
+    if rig_dir is not None:
+        rig_cfg = Path(rig_dir) / "rig.json"
+        if rig_cfg.exists():
+            try:
+                raw_rig = json.loads(rig_cfg.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"Invalid rig configuration in {rig_cfg}: {exc}") from exc
+            if not isinstance(raw_rig, dict):
+                raise ValueError(f"Invalid rig configuration in {rig_cfg}: expected JSON object")
+            resolved_days, protected_globs = _apply_freshness_mapping(
+                raw_rig,
+                str(rig_cfg),
+                platform_targets,
+                resolved_days,
+                protected_globs,
+            )
+
+    if targets_json is not None:
+        t_path = Path(targets_json)
+        if not t_path.exists():
+            raise FileNotFoundError(f"Targets configuration file not found: {t_path}")
+        raw_targets = json.loads(t_path.read_text(encoding="utf-8"))
+        if not isinstance(raw_targets, dict):
+            raise ValueError(f"Invalid targets configuration in {t_path}: expected JSON object")
+        resolved_days, protected_globs = _apply_freshness_mapping(
+            raw_targets,
+            str(t_path),
+            platform_targets,
+            resolved_days,
+            protected_globs,
+            allow_flat_targets=True,
+        )
+
+    if stale_days is not None:
+        if isinstance(stale_days, bool) or not isinstance(stale_days, int) or stale_days < 1:
+            raise ValueError("stale_days must be a positive integer")
+        resolved_days = stale_days
+
+    if isinstance(resolved_days, bool) or not isinstance(resolved_days, int) or resolved_days < 1:
+        raise ValueError("stale_days must be a positive integer")
+
+    return platform_targets, resolved_days, protected_globs
+
+
+def _git_ls_files_proc(repo_root: Path) -> Optional[subprocess.CompletedProcess[str]]:
+    """Run read-only `git ls-files` inside repo_root, returning None if git is unavailable."""
+    try:
+        return subprocess.run(
+            ["git", "ls-files"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+
+
+def run_freshness_scan(
+    paths: Optional[Sequence[Path | str]] = None,
+    *,
+    rig_dir: Optional[Path] = None,
+    targets_json: Optional[Path | str] = None,
+    stale_days: Optional[int] = None,
+    repo_root: Optional[Path] = None,
+    extra_pruned_dirs: Sequence[str] = (),
+    extra_pruned_rel_prefixes: Sequence[str] = (),
+    sentinel_files: Sequence[str] = (),
+    excluded_filenames: Sequence[str] = DEFAULT_EXCLUDED_FILENAMES,
+) -> Dict[str, Any]:
+    """Scan polyglot annotations for expiration and detect stale git-tracked files."""
+    if repo_root is not None:
+        eff_root = Path(repo_root).resolve()
+    elif rig_dir is not None:
+        eff_root = Path(rig_dir).parent.resolve()
+    else:
+        eff_root = Path.cwd().resolve()
+
+    targets_path: Optional[Path] = None
+    if targets_json is not None:
+        targets_path = Path(targets_json)
+        if not targets_path.is_absolute() and repo_root is not None and not targets_path.exists():
+            targets_path = eff_root / targets_path
+
+    platform_targets, resolved_days, protected_globs = _resolve_freshness_config(
+        Path(rig_dir) if rig_dir is not None else None,
+        targets_path,
+        stale_days,
+    )
+
+    scan_targets: List[Path] = []
+    if paths:
+        for raw_p in paths:
+            cand = Path(raw_p)
+            if not cand.is_absolute():
+                alt = eff_root / cand
+                if repo_root is not None and alt.exists():
+                    cand = alt
+                elif not cand.exists() and alt.exists():
+                    cand = alt
+            scan_targets.append(cand)
+    else:
+        scan_targets = [eff_root]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        fut_touched = pool.submit(collect_recently_touched_paths, eff_root, resolved_days)
+        fut_ls = pool.submit(_git_ls_files_proc, eff_root)
+
+        scannable_files: List[Path] = []
+        seen_scannable: set[Path] = set()
+        for target in scan_targets:
+            for cand_file in collect_scannable_files(
+                target,
+                extensions=POLYGLOT_EXTENSIONS,
+                extra_pruned_dirs=extra_pruned_dirs,
+                extra_pruned_rel_prefixes=extra_pruned_rel_prefixes,
+                sentinel_files=sentinel_files,
+                repo_root=eff_root,
+                excluded_filenames=excluded_filenames,
+                max_file_size=MAX_FILE_SIZE,
+            ):
+                try:
+                    key = cand_file.resolve()
+                except OSError:
+                    key = cand_file
+                if key not in seen_scannable:
+                    seen_scannable.add(key)
+                    scannable_files.append(cand_file)
+
+        today_iso = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        expired_annotations: List[Dict[str, Any]] = []
+        deprecated_unscheduled: List[Dict[str, Any]] = []
+
+        for file_path in scannable_files:
+            try:
+                rel_path = file_path.resolve().relative_to(eff_root).as_posix()
+            except ValueError:
+                rel_path = file_path.as_posix()
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            file_expired, file_deprecated = scan_annotations_in_text(
+                content,
+                rel_path,
+                platform_targets,
+                today_iso,
+            )
+            expired_annotations.extend(file_expired)
+            deprecated_unscheduled.extend(file_deprecated)
+
+        recently_touched = fut_touched.result()
+        ls_proc = fut_ls.result()
+
+    stale_files: List[str] = []
+    if recently_touched is not None:
+        if ls_proc is not None and ls_proc.returncode == 0:
+            scope_all = not paths
+            scoped_prefixes: List[str] = []
+            if not scope_all:
+                for cand in scan_targets:
+                    try:
+                        resolved_cand = cand.resolve()
+                    except OSError:
+                        continue
+                    if resolved_cand == eff_root:
+                        scope_all = True
+                        break
+                    try:
+                        rel_cand = resolved_cand.relative_to(eff_root).as_posix()
+                    except ValueError:
+                        continue
+                    if rel_cand == ".":
+                        scope_all = True
+                        break
+                    scoped_prefixes.append(rel_cand.rstrip("/"))
+
+            for raw_tracked in (ls_proc.stdout or "").splitlines():
+                rel_str = raw_tracked.strip().replace("\\", "/")
+                while rel_str.startswith("./"):
+                    rel_str = rel_str[2:]
+                if not rel_str or rel_str in recently_touched:
+                    continue
+                if not scope_all:
+                    if not any(
+                        rel_str == prefix or rel_str.startswith(prefix + "/")
+                        for prefix in scoped_prefixes
+                    ):
+                        continue
+                rel_posix = PurePosixPath(rel_str)
+                if not is_target_applicable(
+                    eff_root / rel_posix,
+                    (),
+                    repo_root=eff_root,
+                    extra_pruned_dirs=extra_pruned_dirs,
+                    extra_pruned_rel_prefixes=extra_pruned_rel_prefixes,
+                    sentinel_files=sentinel_files,
+                    excluded_filenames=excluded_filenames,
+                ):
+                    continue
+                if any(_glob_matches(rel_posix, rel_posix.name, pat) for pat in protected_globs):
+                    continue
+                stale_files.append(rel_str)
+
+    return {
+        "expired_annotations": expired_annotations,
+        "deprecated_unscheduled": deprecated_unscheduled,
+        "stale_files": sorted(stale_files),
+        "stale_threshold_days": resolved_days,
+    }
 
 
 def is_target_applicable(
@@ -2232,7 +2795,8 @@ def validate_traps_cli_args(args: argparse.Namespace, rig_dir: Optional[Path] = 
         if not target_globs or any(not str(g).strip() for g in target_globs):
             raise ValueError("--target-globs must not be empty or contain whitespace-only entries")
 
-    if getattr(args, "subcommand", None) == "scan":
+    subcommand = getattr(args, "subcommand", None)
+    if subcommand in ("scan", "freshness"):
         raw_paths = getattr(args, "paths", None) or []
         safe_ancs = _safe_ancestor_roots(rig_dir)
         for raw_p in raw_paths:
@@ -2252,14 +2816,24 @@ def validate_traps_cli_args(args: argparse.Namespace, rig_dir: Optional[Path] = 
             if any(_bad_trap_path_part(part) for part in (*cand.parts, *abs_cand.parts)):
                 raise ValueError(f"Scan path '{s_path}' must not target '.git' or '.env' paths")
 
-        raw_write_baseline = getattr(args, "write_baseline", None)
-        raw_baseline = getattr(args, "baseline", None)
-        if raw_write_baseline is not None and raw_baseline is not None:
-            raise ValueError("--write-baseline and --baseline cannot be used together")
-        if raw_write_baseline is not None:
-            _resolve_validated_registry_path(raw_write_baseline, rig_dir)
-        if raw_baseline is not None:
-            _resolve_validated_registry_path(raw_baseline, rig_dir)
+        if subcommand == "scan":
+            raw_write_baseline = getattr(args, "write_baseline", None)
+            raw_baseline = getattr(args, "baseline", None)
+            if raw_write_baseline is not None and raw_baseline is not None:
+                raise ValueError("--write-baseline and --baseline cannot be used together")
+            if raw_write_baseline is not None:
+                _resolve_validated_registry_path(raw_write_baseline, rig_dir)
+            if raw_baseline is not None:
+                _resolve_validated_registry_path(raw_baseline, rig_dir)
+        else:
+            raw_targets_json = getattr(args, "targets_json", None)
+            if raw_targets_json is not None:
+                _resolve_validated_registry_path(raw_targets_json, rig_dir)
+            stale_days = getattr(args, "stale_days", None)
+            if stale_days is not None and (
+                isinstance(stale_days, bool) or not isinstance(stale_days, int) or stale_days < 1
+            ):
+                raise ValueError("--stale-days must be a positive integer")
 
     return reg_path
 
@@ -2512,6 +3086,41 @@ def add_traps_parser(subparsers: Any) -> None:
         "--json",
         action="store_true",
         help="Emit structured JSON dismissal result",
+    )
+
+    p_fresh = traps_sub.add_parser(
+        "freshness",
+        help="Check annotation expiration and stale tracked files",
+    )
+    p_fresh.add_argument(
+        "paths",
+        nargs="*",
+        default=None,
+        help="Files or directories to check (defaults to repo root if omitted)",
+    )
+    p_fresh.add_argument(
+        "--targets-json",
+        default=None,
+        dest="targets_json",
+        help="Path to platform targets / freshness override JSON file",
+    )
+    p_fresh.add_argument(
+        "--stale-days",
+        type=int,
+        default=None,
+        dest="stale_days",
+        help="Threshold in days for flagging untouched tracked files as stale",
+    )
+    p_fresh.add_argument(
+        "--fail-on-expired",
+        action="store_true",
+        dest="fail_on_expired",
+        help="Exit with code 1 when expired annotations are found",
+    )
+    p_fresh.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON freshness report",
     )
 
 
@@ -2916,6 +3525,45 @@ def run_traps_command(args: argparse.Namespace, rig_dir: Path) -> int:
             print(f"Dismissed trap {args.id} in {reg_path}")
         return 0
 
+    if sub == "freshness":
+        raw_targets_json = getattr(args, "targets_json", None)
+        targets_json_path = (
+            _resolve_validated_registry_path(raw_targets_json, rig_dir)
+            if raw_targets_json is not None
+            else None
+        )
+        report = run_freshness_scan(
+            getattr(args, "paths", None),
+            rig_dir=rig_dir,
+            targets_json=targets_json_path,
+            stale_days=getattr(args, "stale_days", None),
+        )
+        fail_on_expired = bool(getattr(args, "fail_on_expired", False))
+        failed = fail_on_expired and bool(report["expired_annotations"])
+        if getattr(args, "json", False):
+            payload = dict(report)
+            payload["ok"] = not failed
+            print(json.dumps(payload, indent=2))
+        else:
+            expired = report["expired_annotations"]
+            deprecated = report["deprecated_unscheduled"]
+            stale = report["stale_files"]
+            print(
+                f"Freshness report: {len(expired)} expired, "
+                f"{len(deprecated)} deprecated unscheduled, "
+                f"{len(stale)} stale files (>{report['stale_threshold_days']}d)"
+            )
+            for item in expired:
+                print(
+                    f"  [EXPIRED] {item['file']}:{item['line']} "
+                    f"({item['trap_id']}) {item['forbidden']}"
+                )
+            for item in deprecated:
+                print(f"  [DEPRECATED-UNSCHEDULED] {item['file']}:{item['line']}")
+            for path_str in stale:
+                print(f"  [STALE] {path_str}")
+        return 1 if failed else 0
+
     raise ValueError(f"Unknown traps subcommand: {sub}")
 
 
@@ -2926,9 +3574,11 @@ __all__ = [
     "MAX_PATTERN_LENGTH",
     "POLYGLOT_EXTENSIONS",
     "STARTER_TRAP_PACKS",
+    "TRAP_EVG_001_REMEDIATION",
     "add_traps_parser",
     "audit_content_for_traps",
     "audit_file",
+    "collect_recently_touched_paths",
     "collect_scannable_files",
     "compile_glob_regex",
     "dismiss_trap",
@@ -2939,7 +3589,9 @@ __all__ = [
     "promote_trap",
     "register_trap",
     "resolve_traps_registry_path",
+    "run_freshness_scan",
     "run_traps_command",
+    "scan_annotations_in_text",
     "scan_paths",
     "seed_starter_traps",
     "trap_file_lock",

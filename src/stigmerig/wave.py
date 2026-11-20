@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -18,6 +19,88 @@ STIGMERIG_SWARM_NAME = os.environ.get("STIGMERIG_SWARM_NAME", "StigmeRig Swarm")
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TERMINAL_STATUSES = ("done", "cancelled", "canceled", "archived")
 GIT_IN_PROGRESS_MARKERS = ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
+_WORKTREE_EXCLUDE_PATHSPECS: Tuple[str, ...] = (
+    ":(exclude).stigmerig",
+    ":(exclude).stigmerig/**",
+    ":(exclude).worktrees",
+    ":(exclude).worktrees/**",
+    ":(exclude)*.db-wal",
+    ":(exclude)*.db-shm",
+)
+
+
+def _run_worktree_git_diff(
+    repo_root: Path,
+    diff_args: Sequence[str],
+    diff_range: str,
+) -> Optional[str]:
+    """Run a git diff command with worktree exclusions, returning stdout or None on failure."""
+    cmd = ["git", "diff", *diff_args, diff_range, "--", ".", *_WORKTREE_EXCLUDE_PATHSPECS]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        print(
+            f"Warning: failed to run git diff ({' '.join(diff_args)}): {exc}",
+            file=sys.stderr,
+        )
+        return None
+    if proc.returncode != 0:
+        detail = str(proc.stderr or proc.stdout or "").strip()
+        print(
+            f"Warning: git diff ({' '.join(diff_args)}) exited {proc.returncode}: {detail}",
+            file=sys.stderr,
+        )
+        return None
+    return proc.stdout or ""
+
+
+def _collect_worktree_diff_metrics(
+    repo_root: Path,
+    target_branch: str,
+    expected_ref: str,
+) -> Optional[Dict[str, int]]:
+    """Collect worktree diff metrics relative to the merge base before branch merge."""
+    diff_range = f"refs/heads/{target_branch}...{expected_ref}"
+    numstat_out = _run_worktree_git_diff(repo_root, ("--numstat",), diff_range)
+    if numstat_out is None:
+        return None
+    deleted_out = _run_worktree_git_diff(
+        repo_root, ("--diff-filter=D", "--name-only"), diff_range
+    )
+    if deleted_out is None:
+        return None
+
+    lines_added = 0
+    lines_deleted = 0
+    for raw_line in numstat_out.splitlines():
+        if not raw_line.strip():
+            continue
+        parts = raw_line.split("\t", 2)
+        if len(parts) < 2 or parts[0].strip() == "-" or parts[1].strip() == "-":
+            continue
+        try:
+            lines_added += int(parts[0])
+            lines_deleted += int(parts[1])
+        except ValueError as exc:
+            print(
+                f"Warning: skipping malformed numstat row {raw_line!r}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+
+    files_deleted = sum(1 for line in deleted_out.splitlines() if line.strip())
+    return {
+        "lines_added": lines_added,
+        "lines_deleted": lines_deleted,
+        "net_loc_delta": lines_added - lines_deleted,
+        "files_deleted": files_deleted,
+    }
 _REPO_LOCKS_GUARD = threading.Lock()
 _REPO_LOCKS: Dict[str, threading.RLock] = {}
 
@@ -443,6 +526,7 @@ class WaveRunner:
                     self.db.fail_task(task_id, agent=agent, reason="Action function returned False")
                 return False, f"Task {task_id} execution failed"
 
+            captured_diff_metrics: Optional[Dict[str, int]] = None
             if self.worktree_mgr and worktree_path:
                 expected_ref = f"refs/heads/task/{clean_id}"
                 merge_outcome: Optional[Tuple[bool, str]] = None
@@ -511,6 +595,11 @@ class WaveRunner:
                             cwd=str(self.worktree_mgr.repo_root), capture_output=True, text=True, check=True,
                         )
                         if int(rev_proc.stdout.strip()) > 0:
+                            captured_diff_metrics = _collect_worktree_diff_metrics(
+                                self.worktree_mgr.repo_root,
+                                target_branch,
+                                expected_ref,
+                            )
                             merge_outcome = self.worktree_mgr.merge_worktree(task_id, target_branch=target_branch)
                         else:
                             self.worktree_mgr.remove_worktree(task_id, delete_branch=True)
@@ -541,6 +630,11 @@ class WaveRunner:
                             capture_output=True,
                             check=True,
                         )
+                        captured_diff_metrics = _collect_worktree_diff_metrics(
+                            self.worktree_mgr.repo_root,
+                            target_branch,
+                            expected_ref,
+                        )
                         merge_outcome = self.worktree_mgr.merge_worktree(task_id, target_branch=target_branch)
                 if merge_outcome is not None and not merge_outcome[0]:
                     with self._db_lock:
@@ -556,6 +650,7 @@ class WaveRunner:
                     evidence_paths=evidence_paths,
                     touched_paths=touched_paths,
                     model_id=effective_model,
+                    diff_metrics=captured_diff_metrics,
                 )
         except Exception as exc:
             err_msg = f"{exc}: {d}" if isinstance(exc, subprocess.CalledProcessError) and (d := _proc_detail(exc)) and d not in str(exc) else str(exc)

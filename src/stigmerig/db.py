@@ -16,7 +16,7 @@ import stat
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from stigmerig.traps import trap_file_lock
 
@@ -30,6 +30,147 @@ _LINK_REPARSE_TAGS: frozenset[int] = frozenset({
 })
 _RIG_LOCKS_GUARD = threading.Lock()
 _RIG_LOCKS: Dict[str, threading.RLock] = {}
+
+_ASCII_UINT_RE: re.Pattern[str] = re.compile(r"^[0-9]+$")
+_DIFFSTAT_KV_RE: re.Pattern[str] = re.compile(r"^\s*([A-Za-z_]+)\s*=\s*(-?[0-9]+)\s*$")
+_DIFFSTAT_SHORTSTAT_RE: re.Pattern[str] = re.compile(
+    r"^(?:"
+    r"(?P<files>[0-9]+)\s+files?\s+changed"
+    r"(?:\s*,\s*(?P<ins1>[0-9]+)\s+insertions?\(\+\))?"
+    r"(?:\s*,\s*(?P<del1>[0-9]+)\s+deletions?\(-\))?"
+    r"|"
+    r"(?P<ins2>[0-9]+)\s+insertions?\(\+\)"
+    r"(?:\s*,\s*(?P<del2>[0-9]+)\s+deletions?\(-\))?"
+    r"|"
+    r"(?P<del3>[0-9]+)\s+deletions?\(-\)"
+    r")"
+    r"(?:(?:\s*,\s*|\s+)files_deleted\s*=\s*(?P<fdel>[0-9]+))?$",
+    re.IGNORECASE,
+)
+_DIFFSTAT_KV_KEYS: Dict[str, str] = {
+    "added": "lines_added",
+    "lines_added": "lines_added",
+    "deleted": "lines_deleted",
+    "lines_deleted": "lines_deleted",
+    "files_deleted": "files_deleted",
+}
+
+
+def _validate_diff_metrics(metrics: Optional[Mapping[str, Any]]) -> Optional[Dict[str, int]]:
+    """Validate and normalize a diff_metrics mapping."""
+    if metrics is None:
+        return None
+    if not isinstance(metrics, Mapping):
+        raise ValueError("diff_metrics must be a mapping")
+
+    normalized: Dict[str, int] = {}
+    for field in ("lines_added", "lines_deleted", "files_deleted"):
+        if field not in metrics:
+            raise ValueError(f"diff_metrics missing required field '{field}'")
+        val = metrics[field]
+        if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+            raise ValueError(f"diff_metrics.{field} must be a non-negative integer")
+        normalized[field] = val
+
+    expected_delta = normalized["lines_added"] - normalized["lines_deleted"]
+    net_delta = metrics.get("net_loc_delta")
+    if net_delta is not None:
+        if isinstance(net_delta, bool) or not isinstance(net_delta, int):
+            raise ValueError("diff_metrics.net_loc_delta must be an integer")
+        if net_delta != expected_delta:
+            raise ValueError(
+                f"diff_metrics.net_loc_delta ({net_delta}) does not match lines_added - lines_deleted ({expected_delta})"
+            )
+
+    return {
+        "lines_added": normalized["lines_added"],
+        "lines_deleted": normalized["lines_deleted"],
+        "net_loc_delta": expected_delta,
+        "files_deleted": normalized["files_deleted"],
+    }
+
+
+def _parse_numstat_metrics(text: str) -> Dict[str, int]:
+    """Parse git diff --numstat multi-line rows into raw diff metric counts."""
+    lines_added = 0
+    lines_deleted = 0
+    valid_rows = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split("\t", 2)
+        if len(parts) != 3 or not parts[2].strip():
+            raise ValueError(f"Invalid git diff --numstat row: {line!r}")
+        added_str, deleted_str, _ = parts
+        if added_str == "-" and deleted_str == "-":
+            valid_rows += 1
+            continue
+        if not _ASCII_UINT_RE.fullmatch(added_str) or not _ASCII_UINT_RE.fullmatch(deleted_str):
+            raise ValueError(f"Invalid counts in git diff --numstat row: {line!r}")
+        lines_added += int(added_str)
+        lines_deleted += int(deleted_str)
+        valid_rows += 1
+    if valid_rows == 0:
+        raise ValueError("git diff --numstat contained zero valid rows")
+    return {
+        "lines_added": lines_added,
+        "lines_deleted": lines_deleted,
+        "files_deleted": 0,
+    }
+
+
+def _parse_kv_diffstat_metrics(text: str) -> Dict[str, int]:
+    """Parse comma-separated key=value diffstat strings into raw diff metric counts."""
+    parsed_kv: Dict[str, int] = {}
+    for chunk in text.split(","):
+        kv_match = _DIFFSTAT_KV_RE.fullmatch(chunk)
+        if kv_match is None:
+            raise ValueError(f"Invalid key-value diffstat segment: {chunk.strip()!r}")
+        canonical = _DIFFSTAT_KV_KEYS.get(kv_match.group(1).lower())
+        if canonical is None:
+            raise ValueError(f"Unknown key in diffstat: {kv_match.group(1)!r}")
+        if canonical in parsed_kv:
+            raise ValueError(f"Duplicate key in diffstat: {kv_match.group(1)!r}")
+        parsed_kv[canonical] = int(kv_match.group(2))
+    if "lines_added" not in parsed_kv or "lines_deleted" not in parsed_kv:
+        raise ValueError("Key-value diffstat requires 'added' and 'deleted' fields")
+    parsed_kv.setdefault("files_deleted", 0)
+    return parsed_kv
+
+
+def parse_diffstat_metrics(raw: str) -> Dict[str, int]:
+    """Parse diff metrics from key-value, git --shortstat, or git --numstat text."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("diffstat must be a non-empty string")
+
+    text = raw.strip()
+    metrics_dict: Dict[str, int]
+    if "\t" in text:
+        metrics_dict = _parse_numstat_metrics(text)
+    elif (shortstat_match := _DIFFSTAT_SHORTSTAT_RE.fullmatch(text)) is not None:
+        added_raw = shortstat_match.group("ins1") or shortstat_match.group("ins2") or "0"
+        deleted_raw = (
+            shortstat_match.group("del1")
+            or shortstat_match.group("del2")
+            or shortstat_match.group("del3")
+            or "0"
+        )
+        fdel_raw = shortstat_match.group("fdel") or "0"
+        metrics_dict = {
+            "lines_added": int(added_raw),
+            "lines_deleted": int(deleted_raw),
+            "files_deleted": int(fdel_raw),
+        }
+    elif "=" in text:
+        metrics_dict = _parse_kv_diffstat_metrics(text)
+    else:
+        raise ValueError(f"Unrecognized diffstat format: {text!r}")
+
+    validated = _validate_diff_metrics(metrics_dict)
+    if validated is None:
+        raise ValueError("Invalid diff_metrics")
+    return validated
 
 
 def _is_link_or_junction(path: Path) -> bool:
@@ -228,7 +369,15 @@ DEFAULT_RIG_JSON_TEMPLATE = """{
     "infra",
     "release",
     "destructive"
-  ]
+  ],
+  "platform_targets": {},
+  "freshness": {
+    "stale_threshold_days": 180,
+    "protected_globs": [
+      "**/migrations/**",
+      "**/contracts/**"
+    ]
+  }
 }
 """
 
@@ -425,6 +574,11 @@ class StigmeRigDB:
             "high_friction_globs": (),
             "archetype_models": {},
             "frontier_model_tokens": DEFAULT_FRONTIER_MODEL_TOKENS,
+            "platform_targets": {},
+            "freshness": {
+                "stale_threshold_days": 180,
+                "protected_globs": ("**/migrations/**", "**/contracts/**"),
+            },
         }
         rig_json = self.rig_dir / "rig.json"
         if not rig_json.is_file():
@@ -474,6 +628,39 @@ class StigmeRigDB:
             ):
                 raise ValueError("Invalid frontier_model_tokens in rig.json: must be a list of non-empty strings")
             defaults["frontier_model_tokens"] = tuple(t.strip().lower() for t in raw_tokens)
+
+        raw_targets = raw.get("platform_targets")
+        if raw_targets is not None:
+            if not isinstance(raw_targets, dict):
+                raise ValueError("Invalid platform_targets in rig.json: must be an object")
+            norm_targets: Dict[str, str] = {}
+            for k, v in raw_targets.items():
+                if not isinstance(k, str) or not k.strip() or not k.isprintable():
+                    raise ValueError("Invalid platform_targets key in rig.json")
+                if not isinstance(v, str) or not v.strip() or not v.isprintable():
+                    raise ValueError("Invalid platform_targets value in rig.json")
+                norm_targets[k.strip().lower()] = v.strip()
+            defaults["platform_targets"] = norm_targets
+
+        raw_freshness = raw.get("freshness")
+        if raw_freshness is not None:
+            if not isinstance(raw_freshness, dict):
+                raise ValueError("Invalid freshness in rig.json: must be an object")
+            freshness_cfg = dict(defaults["freshness"])
+            stale_days = raw_freshness.get("stale_threshold_days")
+            if stale_days is not None:
+                if isinstance(stale_days, bool) or not isinstance(stale_days, int) or stale_days < 1:
+                    raise ValueError(f"Invalid freshness.stale_threshold_days in rig.json: {stale_days!r}")
+                freshness_cfg["stale_threshold_days"] = stale_days
+            protected_globs = raw_freshness.get("protected_globs")
+            if protected_globs is not None:
+                if not isinstance(protected_globs, list) or any(
+                    not isinstance(g, str) or not g.strip() or not g.isprintable()
+                    for g in protected_globs
+                ):
+                    raise ValueError("Invalid freshness.protected_globs in rig.json: must be a list of non-empty printable strings")
+                freshness_cfg["protected_globs"] = tuple(g.strip().replace("\\", "/") for g in protected_globs)
+            defaults["freshness"] = freshness_cfg
 
         return defaults
 
@@ -1456,6 +1643,7 @@ Add task details and acceptance criteria here.
         model_id: Optional[str] = None,
         follow_ups: Optional[Sequence[str]] = None,
         follow_up_ids_out: Optional[List[str]] = None,
+        diff_metrics: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[bool, str]:
         """Mark task as done enforcing anti-self-approval and intentional friction when required."""
         self._validate_task_id(task_id)
@@ -1473,6 +1661,7 @@ Add task details and acceptance criteria here.
             raise ValueError("session_id must be a non-empty printable string")
         resolved_model = resolve_model_id(model_id)
         norm_touched = self._validate_touched_paths(touched_paths)
+        norm_diff_metrics = _validate_diff_metrics(diff_metrics)
         norm_follow_ups = self._validate_follow_ups(follow_ups, follow_up_ids_out)
         if norm_follow_ups:
             if _is_link_or_junction(self.tasks_dir):
@@ -1548,6 +1737,8 @@ Add task details and acceptance criteria here.
         }
         if resolved_model is not None:
             event_payload["model_id"] = resolved_model
+        if norm_diff_metrics is not None:
+            event_payload["diff_metrics"] = norm_diff_metrics
         if evidence_records:
             event_payload["evidence"] = evidence_records
         version = task.get("version", 0)
@@ -1589,6 +1780,7 @@ Add task details and acceptance criteria here.
         evidence_paths: Optional[Sequence[str | Path]] = None,
         session_id: Optional[str] = None,
         model_id: Optional[str] = None,
+        diff_metrics: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[bool, str]:
         """Transition a working task to review with verification receipt and SHA-256 evidence."""
         self._validate_task_id(task_id)
@@ -1607,6 +1799,7 @@ Add task details and acceptance criteria here.
         if session_id is not None and (not isinstance(session_id, str) or not session_id.strip() or not session_id.isprintable()):
             raise ValueError("session_id must be a non-empty printable string")
         resolved_model = resolve_model_id(model_id)
+        norm_diff_metrics = _validate_diff_metrics(diff_metrics)
 
         self._ensure_queue_ready()
         self._ensure_audit_ready()
@@ -1640,6 +1833,8 @@ Add task details and acceptance criteria here.
             event_payload["verification_cmd"] = verification_cmd
         if diffstat is not None:
             event_payload["diffstat"] = diffstat
+        if norm_diff_metrics is not None:
+            event_payload["diff_metrics"] = norm_diff_metrics
         if evidence_records:
             event_payload["evidence"] = evidence_records
 
@@ -1739,6 +1934,8 @@ Add task details and acceptance criteria here.
         if task.get("claimed_by"):
             implementers.add(str(task["claimed_by"]))
         latest_review_evidence: List[Dict[str, Any]] = []
+        latest_review_diff_metrics: Optional[Dict[str, int]] = None
+        seen_latest_review_diff = False
         latest_implementer: Optional[str] = task.get("claimed_by")
 
         with self.get_queue_conn() as conn:
@@ -1777,6 +1974,14 @@ Add task details and acceptance criteria here.
                                     ]
                                     if valid_ev:
                                         latest_review_evidence = valid_ev
+                            if ev_type == "review_submitted" and not seen_latest_review_diff:
+                                seen_latest_review_diff = True
+                                raw_diff_metrics = parsed.get("diff_metrics")
+                                if isinstance(raw_diff_metrics, dict):
+                                    try:
+                                        latest_review_diff_metrics = _validate_diff_metrics(raw_diff_metrics)
+                                    except ValueError:
+                                        latest_review_diff_metrics = None
 
         for imp in sorted(implementers):
             if _is_self_approval(imp, verifier):
@@ -1807,6 +2012,8 @@ Add task details and acceptance criteria here.
         }
         if resolved_model is not None:
             event_payload["model_id"] = resolved_model
+        if latest_review_diff_metrics is not None:
+            event_payload["diff_metrics"] = latest_review_diff_metrics
         if evidence_records:
             event_payload["evidence"] = evidence_records
 

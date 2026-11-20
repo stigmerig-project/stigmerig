@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from stigmerig.db import TASK_ID_PATTERN, StigmeRigDB, _atomic_write_text, _is_self_approval, resolve_rig_dir
+from stigmerig.db import TASK_ID_PATTERN, StigmeRigDB, _atomic_write_text, _is_self_approval, parse_diffstat_metrics, resolve_rig_dir
 from stigmerig.traps import add_traps_parser, run_traps_command, validate_traps_cli_args
 
 VALID_TASK_STATUSES = frozenset({"todo", "working", "review", "done", "blocked", "cancelled", "canceled", "archived"})
@@ -63,6 +63,9 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
         val = getattr(args, field, None)
         if val is not None and not str(os.fspath(val) if isinstance(val, os.PathLike) else val).strip():
             raise ValueError(f"--{field.replace('_', '-')} must not be empty or whitespace")
+    if getattr(args, "command", None) == "task" and getattr(args, "subcommand", None) == "done":
+        if getattr(args, "diffstat", None) is not None:
+            parse_diffstat_metrics(args.diffstat)
     tags = getattr(args, "tags", None)
     if tags is not None and any(not part.strip() for part in tags.split(",")):
         raise ValueError("--tags must not be empty or contain whitespace-only entries")
@@ -361,6 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="follow_ups",
         help="Repeatable follow-up task title to spawn on completion",
     )
+    p_tdone.add_argument("--diffstat", default=None, help="Optional diffstat, numstat, or key-value diff metrics summary")
 
     p_trev = task_sub.add_parser("review", help="Submit a working task for review")
     p_trev.add_argument("--id", required=True, help="Task ID to submit for review")
@@ -524,6 +528,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             if args.subcommand == "done":
                 fu_ids: list[str] = []
+                done_diff_metrics = parse_diffstat_metrics(args.diffstat) if getattr(args, "diffstat", None) else None
                 ok, msg = rig.complete_task(
                     task_id=args.id,
                     agent=args.agent,
@@ -534,6 +539,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     model_id=args.model,
                     follow_ups=getattr(args, "follow_ups", None),
                     follow_up_ids_out=fu_ids,
+                    diff_metrics=done_diff_metrics,
                 )
                 if ok:
                     next_step = rig.get_next_workflow_step(args.id)
@@ -551,10 +557,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 1
 
             if args.subcommand == "review":
+                review_diff_metrics = None
+                if getattr(args, "diffstat", None):
+                    try:
+                        review_diff_metrics = parse_diffstat_metrics(args.diffstat)
+                    except ValueError:
+                        review_diff_metrics = None
                 ok, msg = rig.submit_for_review(
                     task_id=args.id, agent=args.agent, summary=args.summary,
                     verification_cmd=args.verification_cmd, diffstat=args.diffstat, evidence_paths=args.evidence,
                     model_id=args.model,
+                    diff_metrics=review_diff_metrics,
                 )
                 if ok:
                     print(json.dumps({"ok": True, "task_id": args.id, "message": msg}, indent=2))

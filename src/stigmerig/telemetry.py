@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from stigmerig.db import DEFAULT_FRONTIER_MODEL_TOKENS, StigmeRigDB, _escape_md_cell, _is_self_approval
+from stigmerig.db import DEFAULT_FRONTIER_MODEL_TOKENS, StigmeRigDB, _escape_md_cell, _is_self_approval, _validate_diff_metrics
 
 
 VERIFY_ONLY_ARCHETYPES: frozenset[str] = frozenset({
@@ -381,6 +381,7 @@ class TelemetryExporter:
         force_claimed_leaf_ids: set[str] = set()
         verified_completed_ids: set[str] = set()
         over_ids: set[str] = set()
+        diff_metrics_by_task: Dict[str, Dict[str, int]] = {}
         for ev in events:
             tid = str(ev.get("task_id") or "").strip()
             if not tid or tid not in leaf_ids:
@@ -408,6 +409,14 @@ class TelemetryExporter:
                 implementer = str(payload_d.get("implementer") or ev.get("agent") or "").strip()
                 if verifier and not _is_self_approval(implementer, verifier) and not _is_self_approval(ev.get("agent"), verifier):
                     verified_completed_ids.add(tid)
+                raw_dm = payload_d.get("diff_metrics")
+                if isinstance(raw_dm, dict):
+                    try:
+                        norm_dm = _validate_diff_metrics(raw_dm)
+                    except ValueError:
+                        norm_dm = None
+                    if norm_dm is not None:
+                        diff_metrics_by_task[tid] = norm_dm
 
         pending_review_tasks = sum(
             1 for t in leaf_tasks if str(t.get("status") or "").strip().lower() == "review"
@@ -551,6 +560,12 @@ class TelemetryExporter:
             and str(t.get("status") or "").strip().lower() != "dismissed"
         ]
 
+        lines_added_total = sum(m["lines_added"] for m in diff_metrics_by_task.values())
+        lines_deleted_total = sum(m["lines_deleted"] for m in diff_metrics_by_task.values())
+        net_loc_delta_total = sum(m["net_loc_delta"] for m in diff_metrics_by_task.values())
+        files_deleted_total = sum(m["files_deleted"] for m in diff_metrics_by_task.values())
+        subtractive_task_count = sum(1 for m in diff_metrics_by_task.values() if m["net_loc_delta"] < 0)
+
         return {
             "total_tasks": total_tasks,
             "total_records": total_records,
@@ -569,6 +584,11 @@ class TelemetryExporter:
             "tier_overprovisioned_count": len(over_ids),
             "tier_overprovisioned_tasks": sorted(over_ids),
             "tier_overprovisioned_alert": bool(over_ids),
+            "lines_added_total": lines_added_total,
+            "lines_deleted_total": lines_deleted_total,
+            "net_loc_delta_total": net_loc_delta_total,
+            "files_deleted_total": files_deleted_total,
+            "subtractive_task_count": subtractive_task_count,
             "epics": epics_summary,
             "blocked_reasons": {
                 "by_reason": reason_counts,
@@ -624,6 +644,7 @@ class TelemetryExporter:
             f"- **Unverified Completion Rate (`unverified_completion_rate`)**: {gov['unverified_completion_rate']:.4f}",
             f"- **Recorded Traps**: {gov['blocked_reasons']['total_traps']} total, {len(gov['blocked_reasons']['recurring_candidates'])} recurring candidates",
             f"- **Tier Over-Provisioned Verifiers (`tier_overprovisioned_count`)**: {gov['tier_overprovisioned_count']} (`tier_overprovisioned_alert`: `{gov['tier_overprovisioned_alert']}`)",
+            f"- **Subtractive Tasks (`subtractive_task_count`)**: {gov['subtractive_task_count']} (`net_loc_delta_total`: `{gov['net_loc_delta_total']:+d}`, `+{gov['lines_added_total']}` / `-{gov['lines_deleted_total']}`, files deleted: `{gov['files_deleted_total']}`)",
         ])
 
         if gov["epics"]:
