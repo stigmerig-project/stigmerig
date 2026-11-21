@@ -55,6 +55,13 @@ _DIFFSTAT_KV_KEYS: Dict[str, str] = {
     "files_deleted": "files_deleted",
 }
 
+HIGH_FRICTION_PR_RUBRIC: Tuple[str, ...] = (
+    "PR Rubric [root_cause]: Verify the change resolves the underlying root cause rather than masking symptoms.",
+    "PR Rubric [edge_cases]: Verify boundary inputs, empty states, and error paths are handled.",
+    "PR Rubric [scope_hygiene]: Enforce minimal diff scope with zero edits to existing test assertions.",
+    "PR Rubric [verification]: Cite targeted test command output and pass/fail counts as --evidence.",
+)
+
 
 def _validate_diff_metrics(metrics: Optional[Mapping[str, Any]]) -> Optional[Dict[str, int]]:
     """Validate and normalize a diff_metrics mapping."""
@@ -711,6 +718,19 @@ class StigmeRigDB:
                     if _match_segment_glob(tp, pat):
                         return True
         return False
+
+    def get_high_friction_rubric(
+        self,
+        task: Mapping[str, Any],
+        touched_paths: Sequence[str] = (),
+    ) -> Tuple[str, ...]:
+        """Return the 4-axis PR rubric criteria when task tags or paths trigger intentional friction."""
+        if not isinstance(task, Mapping):
+            return ()
+        norm_touched = self._validate_touched_paths(touched_paths)
+        if self._matches_intentional_friction(dict(task), norm_touched):
+            return HIGH_FRICTION_PR_RUBRIC
+        return ()
 
     def _validate_icm_paths(self, *, include_icm_files: bool = True) -> None:
         """Reject symlinks and NTFS junctions on parent_dir, rig_dir, AGENTS.md, and sidecar."""

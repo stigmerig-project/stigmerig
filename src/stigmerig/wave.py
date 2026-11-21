@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import fnmatch
 from functools import wraps
+import json
 import os
 import re
 import shutil
@@ -101,6 +103,54 @@ def _collect_worktree_diff_metrics(
         "net_loc_delta": lines_added - lines_deleted,
         "files_deleted": files_deleted,
     }
+
+
+_REMOVED_ASSERTION_RE: re.Pattern[str] = re.compile(
+    r"^(?:assert(?:\b|\s*\()|self\.assert[A-Za-z_]*\s*\(|pytest\.raises\s*\(|expect\s*\(|assert_(?:eq|ne)!\s*\()"
+)
+
+
+def _is_test_path(rel_path: str) -> bool:
+    """Return True when rel_path resides in a test directory or matches common test file naming."""
+    norm = rel_path.strip().replace("\\", "/").lstrip("/")
+    if not norm:
+        return False
+    parts = [p.lower() for p in norm.split("/") if p]
+    if not parts:
+        return False
+    if any(seg in {"test", "tests", "__tests__"} for seg in parts[:-1]):
+        return True
+    base = parts[-1]
+    return any(fnmatch.fnmatch(base, pat) for pat in ("test_*.*", "*_test.*", "*.test.*", "*.spec.*"))
+
+
+def _detect_test_assertion_deletions(diff_text: str) -> List[str]:
+    """Return sorted test file paths whose unified diff removes or edits existing assertion lines."""
+    flagged: set[str] = set()
+    old_path: Optional[str] = None
+    cur_path: Optional[str] = None
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            old_path = None
+            cur_path = None
+        elif line.startswith("--- "):
+            raw_old = line[4:].strip()
+            if raw_old.startswith("a/"):
+                raw_old = raw_old[2:]
+            old_path = None if raw_old == "/dev/null" else raw_old
+        elif line.startswith("+++ "):
+            raw_new = line[4:].strip()
+            if raw_new.startswith("b/"):
+                raw_new = raw_new[2:]
+            new_path = None if raw_new == "/dev/null" else raw_new
+            cur_path = new_path or old_path
+        elif cur_path and _is_test_path(cur_path) and line.startswith("-") and not line.startswith("---"):
+            removed = line[1:].lstrip()
+            if _REMOVED_ASSERTION_RE.match(removed):
+                flagged.add(cur_path)
+    return sorted(flagged)
+
+
 _REPO_LOCKS_GUARD = threading.Lock()
 _REPO_LOCKS: Dict[str, threading.RLock] = {}
 
@@ -582,6 +632,41 @@ class WaveRunner:
                             with self._db_lock:
                                 self.db.fail_task(task_id, agent=agent, reason=friction_err)
                             return False, friction_err
+                    if (
+                        friction_triggered
+                        and arch.strip().lower() != "unit_tester"
+                        and any(_is_test_path(p) for p in touched_paths)
+                    ):
+                        cached_u0_proc = subprocess.run(
+                            ["git", "diff", "--cached", "-U0", "--", ".", *_WORKTREE_EXCLUDE_PATHSPECS],
+                            cwd=str(worktree_path),
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        cached_u0 = cached_u0_proc.stdout if cached_u0_proc.returncode == 0 else ""
+                        branch_u0 = _run_worktree_git_diff(
+                            self.worktree_mgr.repo_root,
+                            ("-U0",),
+                            f"refs/heads/{target_branch}...{expected_ref}",
+                        ) or ""
+                        flagged_tests = sorted(
+                            set(_detect_test_assertion_deletions(cached_u0))
+                            | set(_detect_test_assertion_deletions(branch_u0))
+                        )
+                        if flagged_tests:
+                            print(
+                                f"Warning: high-friction task '{task_id}' ({arch}) modified or removed test assertions in: {', '.join(flagged_tests)}",
+                                file=sys.stderr,
+                            )
+                            with self._db_lock:
+                                self.db.log_audit(
+                                    task_id=task_id,
+                                    action="scope_hygiene_warn",
+                                    agent=agent,
+                                    verification_status="warn",
+                                    payload=json.dumps({"archetype": arch, "test_files": flagged_tests}),
+                                )
                     diff_proc = subprocess.run(
                         ["git", "diff", "--cached", "--quiet"],
                         cwd=str(worktree_path),

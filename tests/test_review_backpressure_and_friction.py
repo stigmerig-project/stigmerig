@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import gc
+import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,9 +16,16 @@ from pathlib import Path
 import stigmerig.cli as cli
 from stigmerig.db import (
     DEFAULT_RIG_JSON_TEMPLATE,
+    HIGH_FRICTION_PR_RUBRIC,
     StigmeRigDB,
     VERIFY_ONLY_ARCHETYPES,
     _match_segment_glob,
+)
+from stigmerig.wave import (
+    WaveRunner,
+    WorktreeManager,
+    _detect_test_assertion_deletions,
+    _is_test_path,
 )
 
 
@@ -353,6 +364,195 @@ class TestReviewBackpressureAndFriction(unittest.TestCase):
         ])
         with self.assertRaises(ValueError):
             cli._validate_cli_args(args)
+
+    def test_high_friction_rubric_and_cli_json(self) -> None:
+        self._write_rig_json({
+            "version": "0.1.0",
+            "max_pending_review": 3,
+            "high_friction_tags": ["security", "migration"],
+            "high_friction_globs": ["migrations/**"],
+        })
+        self.db.create_task("TASK-901", "Harden auth tokens", tags="security")
+        self.db.create_task("TASK-902", "Update docs wording", tags="docs")
+        self.db.create_task("TASK-903", "Apply schema v2", tags="migration")
+
+        hf_task = self.db.get_task("TASK-901")
+        normal_task = self.db.get_task("TASK-902")
+        self.assertIsNotNone(hf_task)
+        self.assertIsNotNone(normal_task)
+
+        self.assertEqual(len(HIGH_FRICTION_PR_RUBRIC), 4)
+        self.assertEqual(self.db.get_high_friction_rubric(hf_task), HIGH_FRICTION_PR_RUBRIC)
+        self.assertEqual(self.db.get_high_friction_rubric(normal_task), ())
+        self.assertEqual(
+            self.db.get_high_friction_rubric(normal_task, touched_paths=["migrations/001.sql"]),
+            HIGH_FRICTION_PR_RUBRIC,
+        )
+        self.assertEqual(self.db.get_high_friction_rubric("invalid"), ())  # type: ignore[arg-type]
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["--rig-dir", str(self.rig_dir), "task", "get", "--id", "TASK-901"])
+        self.assertEqual(rc, 0)
+        got_hf = json.loads(buf.getvalue())
+        self.assertEqual(got_hf["high_friction_rubric"], list(HIGH_FRICTION_PR_RUBRIC))
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["--rig-dir", str(self.rig_dir), "task", "get", "--id", "TASK-902"])
+        self.assertEqual(rc, 0)
+        got_norm = json.loads(buf.getvalue())
+        self.assertNotIn("high_friction_rubric", got_norm)
+
+        # Plain-text claim output remains unchanged without --json
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["--rig-dir", str(self.rig_dir), "task", "claim", "--id", "TASK-901", "--agent", "builder-a"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), "Task TASK-901 claimed by builder-a")
+
+        # --json omits rubric on ordinary tasks and includes it on high-friction tasks
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["--rig-dir", str(self.rig_dir), "task", "claim", "--id", "TASK-902", "--agent", "builder-a", "--json"])
+        self.assertEqual(rc, 0)
+        claim_norm = json.loads(buf.getvalue())
+        self.assertEqual(claim_norm, {"ok": True, "task_id": "TASK-902", "claimed_by": "builder-a"})
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["--rig-dir", str(self.rig_dir), "task", "claim", "--id", "TASK-903", "--agent", "builder-a", "--json"])
+        self.assertEqual(rc, 0)
+        claim_hf = json.loads(buf.getvalue())
+        self.assertEqual(claim_hf["ok"], True)
+        self.assertEqual(claim_hf["task_id"], "TASK-903")
+        self.assertEqual(claim_hf["claimed_by"], "builder-a")
+        self.assertEqual(claim_hf["high_friction_rubric"], list(HIGH_FRICTION_PR_RUBRIC))
+
+        # Legacy rig without friction keys returns empty rubric
+        self._write_rig_json({"version": "0.1.0", "icm_enabled": True})
+        self.assertEqual(self.db.get_high_friction_rubric(hf_task), ())
+
+    def test_detect_test_assertion_deletions_and_wave_warning(self) -> None:
+        self.assertTrue(_is_test_path("tests/test_auth.py"))
+        self.assertTrue(_is_test_path("pkg/__tests__/auth.spec.ts"))
+        self.assertTrue(_is_test_path("unit_test.go"))
+        self.assertFalse(_is_test_path("src/auth.py"))
+
+        sample_diff = "\n".join([
+            "diff --git a/tests/test_sample.py b/tests/test_sample.py",
+            "--- a/tests/test_sample.py",
+            "+++ b/tests/test_sample.py",
+            "@@ -10,3 +10,2 @@",
+            "-    # assert commented out should be ignored",
+            "-    assert result == 42",
+            "diff --git a/tests/test_clean.py b/tests/test_clean.py",
+            "--- a/tests/test_clean.py",
+            "+++ b/tests/test_clean.py",
+            "@@ -1,1 +1,1 @@",
+            "-# old comment only",
+            "diff --git a/src/app.py b/src/app.py",
+            "--- a/src/app.py",
+            "+++ b/src/app.py",
+            "@@ -5,1 +5,1 @@",
+            "-assert invariant_ok()",
+        ])
+        self.assertEqual(_detect_test_assertion_deletions(sample_diff), ["tests/test_sample.py"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test Runner"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "user.email", "runner@local.test"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=str(repo), check=True)
+            (repo / "tests").mkdir()
+            (repo / "tests" / "test_auth.py").write_text(
+                "def test_ok():\n    assert 1 == 1\n    assert 2 == 2\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "tests/test_auth.py"], cwd=str(repo), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init tests"], cwd=str(repo), check=True, capture_output=True)
+
+            db = StigmeRigDB(rig_dir=repo / ".stigmerig", workspace_root=repo)
+            db.init_rig(scaffold_icm=False)
+            (repo / ".stigmerig" / "rig.json").write_text(
+                json.dumps({
+                    "version": "0.1.0",
+                    "max_pending_review": 3,
+                    "high_friction_tags": ["security", "infra"],
+                }, indent=2),
+                encoding="utf-8",
+            )
+            wt_mgr = WorktreeManager(repo_root=repo)
+            runner = WaveRunner(db=db, worktree_mgr=wt_mgr)
+            evidence = repo / "proof.log"
+            evidence.write_text("targeted check ok\n", encoding="utf-8")
+
+            try:
+                db.create_task("TASK-904", "Edit code with deleted test assertion", tags="security")
+
+                def non_tester_edit(exec_dir: Path) -> bool:
+                    (exec_dir / "tests" / "test_auth.py").write_text(
+                        "def test_ok():\n    assert 2 == 2\n",
+                        encoding="utf-8",
+                    )
+                    return True
+
+                err_buf = io.StringIO()
+                with contextlib.redirect_stderr(err_buf):
+                    ok, msg = runner.run_task_in_worktree(
+                        task_id="TASK-904",
+                        agent="builder-1",
+                        action_fn=non_tester_edit,
+                        verifier="verifier-1",
+                        archetype="diff_synthesizer",
+                        allow_self_approval=False,
+                        evidence_paths=[evidence],
+                    )
+                self.assertTrue(ok, msg)
+                self.assertIn("tests/test_auth.py", err_buf.getvalue())
+
+                db.create_task("TASK-905", "Unit tester edits test assertions intentionally", tags="security")
+
+                def unit_tester_edit(exec_dir: Path) -> bool:
+                    (exec_dir / "tests" / "test_auth.py").write_text(
+                        "def test_ok():\n    return None\n",
+                        encoding="utf-8",
+                    )
+                    return True
+
+                err_buf2 = io.StringIO()
+                with contextlib.redirect_stderr(err_buf2):
+                    ok2, msg2 = runner.run_task_in_worktree(
+                        task_id="TASK-905",
+                        agent="tester-1",
+                        action_fn=unit_tester_edit,
+                        verifier="verifier-1",
+                        archetype="unit_tester",
+                        allow_self_approval=False,
+                        evidence_paths=[evidence],
+                    )
+                self.assertTrue(ok2, msg2)
+                self.assertNotIn("Warning: high-friction task 'TASK-905'", err_buf2.getvalue())
+
+                with db.get_audit_conn() as aconn:
+                    rows = aconn.execute(
+                        "SELECT task_id, action, verification_status FROM audit_log WHERE action = 'scope_hygiene_warn'"
+                    ).fetchall()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["task_id"], "TASK-904")
+                self.assertEqual(rows[0]["verification_status"], "warn")
+                audit_ok, audit_msg = db.verify_audit_chain()
+                self.assertTrue(audit_ok, audit_msg)
+            finally:
+                for tid in ("TASK-904", "TASK-905"):
+                    try:
+                        wt_mgr.remove_worktree(tid, delete_branch=True)
+                    except Exception:
+                        pass
+                subprocess.run(["git", "worktree", "prune"], cwd=str(repo), capture_output=True)
+                gc.collect()
 
 
 if __name__ == "__main__":

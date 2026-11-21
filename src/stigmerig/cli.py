@@ -338,6 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tclaim.add_argument("--agent", required=True, help="Agent claiming the task")
     p_tclaim.add_argument("--ttl", type=int, default=1800, help="Lease TTL in seconds (default 1800)")
     p_tclaim.add_argument("--force-backpressure", action="store_true", help="Override review-queue backpressure")
+    p_tclaim.add_argument("--json", action="store_true", help="Emit structured JSON claim receipt")
 
     p_tdone = task_sub.add_parser("done", help="Complete a task with anti-self-approval gate")
     p_tdone.add_argument("--id", required=True, help="Task ID to mark done")
@@ -515,13 +516,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if not task:
                     print(f"[ERROR] Task {args.id} not found", file=sys.stderr)
                     return 1
-                print(json.dumps(task, indent=2))
+                out = dict(task)
+                rubric = rig.get_high_friction_rubric(task)
+                if rubric:
+                    out["high_friction_rubric"] = list(rubric)
+                print(json.dumps(out, indent=2))
                 return 0
 
             if args.subcommand == "claim":
                 ok = rig.claim_task(task_id=args.id, agent=args.agent, ttl_seconds=args.ttl, ignore_backpressure=args.force_backpressure)
                 if ok:
-                    print(f"Task {args.id} claimed by {args.agent}")
+                    if getattr(args, "json", False):
+                        claimed_task = rig.get_task(args.id) or {}
+                        payload: dict[str, object] = {
+                            "ok": True,
+                            "task_id": args.id,
+                            "claimed_by": args.agent,
+                        }
+                        rubric = rig.get_high_friction_rubric(claimed_task)
+                        if rubric:
+                            payload["high_friction_rubric"] = list(rubric)
+                        print(json.dumps(payload, indent=2))
+                    else:
+                        print(f"Task {args.id} claimed by {args.agent}")
                     return 0
                 print(f"[ERROR] Failed to claim task {args.id}: {_claim_failure_reason(rig, args.id, args.agent)}", file=sys.stderr)
                 return 1

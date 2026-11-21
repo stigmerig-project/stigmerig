@@ -233,6 +233,12 @@ Agents claim tasks using atomic Compare-And-Swap (CAS) leases. Leases expire aft
 stigmerig task claim --id TASK-001 --agent AgentAlpha --ttl 1800
 ```
 
+Pass `--json` to return structured claim output. High-friction tasks attach a 4-axis `high_friction_rubric` in both `task claim --json` and `task get`:
+
+```bash
+stigmerig task claim --id TASK-001 --agent AgentAlpha --json
+```
+
 ### 4. Submit Tasks for Asynchronous Review
 
 Agents submit completed work for review with cryptographic verification evidence:
