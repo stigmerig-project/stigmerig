@@ -139,8 +139,9 @@ Heavy Tier 3 automation (`1,000+` external issues, `500+` contributors) stays ou
 - **Embedded ONNX Vector Search**: Local model downloads break the Python stdlib `dependencies = []` guarantee. Offload embeddings to `Qdrant` or `pgvector`.
 - **Multi-Model Referee Routing Policies**: Model cascades belong in external gateway layers. Delegate routing to Plane 3 routers like `LiteLLM` or `Envoy`.
 - **Speculative `50`-PR Merge Batching**: Multi-PR integration batching exceeds the `3-5` task wave ceiling. Run large queues on dedicated CI orchestration runners.
+- **Persistent JVM or SMT Formal Verifiers**: Bundling TLA+, Lean, or Z3 breaks dependencies = []. Run formal checkers in external CI or spikes.
 
-## Security and Concurrency Invariants (v0.1.7)
+## Security and Concurrency Invariants (v0.1.8)
 
 StigmeRig enforces operational security and concurrency invariants across all workflows:
 
@@ -157,15 +158,17 @@ StigmeRig enforces operational security and concurrency invariants across all wo
 - **Local-First SQLite WAL State**: Coordinates concurrent readers and writers in `.stigmerig/queue.db` with zero network brokers.
 - **WORM Cryptographic Audit Ledger**: Protects `.stigmerig/audit.db` with SHA-256 hash chaining and SQLite `BEFORE UPDATE` and `BEFORE DELETE` triggers.
 - **Review-Queue Backpressure**: Atomic SQLite subqueries throttle builder claims when unreviewed tasks reach `max_pending_review`.
-- **Intentional Friction Gates**: Blocks self-approval and mandates cryptographic evidence for sensitive tags and paths.
+- **Intentional Friction and 4-Axis PR Rubric**: Blocks self-approval, requires SHA-256 evidence, attaches `high_friction_rubric`, and logs `scope_hygiene_warn` on removed test assertions.
 - **ICM Startup Scaffolding and Sync**: Generates `AGENTS.md`, `CONTEXT.md`, and `.stigmerig/rig.json` with sidecar fallback. Verifies and syncs SHA-256 markers via `--check` and `--sync-icm`.
 - **Composite Anti-Self-Approval Gate**: Blocks direct and aliased self-verification across `seat/agent`, `agent@host`, and `role:agent` identifiers.
 - **Non-Blocking Follow-Up Spawning**: Repeatable `--follow-up` flags on `task done` and `task approve` atomically spawn top-level `FU-` backlog tasks.
 - **Rolling Git Worktree Waves**: Executes 3 to 5 tasks per batch in `.worktrees/<ID>` with archetype commit attribution and `--no-ff` merges.
 - **Anti-DMV and Wave Topology Telemetry**: Computes `verify_only_ratio`, `ceremony_ratio`, `review_wait_ratio`, epic `phase_depth`, and Mermaid handoff diagrams.
+- **Subtractive Evergreen Telemetry and Freshness**: Tracks `@remove-when` expiration (`TRAP-EVG-001`), stale files, `net_loc_delta_total`, and `subtractive_task_count`.
 - **Config-Driven Model Lineage and Tier Telemetry**: Maps archetype models via `rig.json` `archetype_models`, adds `WaveRunner` `Model:` trailers, and tracks `tier_overprovisioned_alert`.
 - **Brownfield Baseline Ratchets**: Suppresses legacy violations using multiset fingerprints while catching net-new regressions.
 - **Verification Trap Pack**: Catches skipped tests, blanket linter suppressions, and unverified documentation stubs.
+- **Diff-Scoped Vacuous Test Guard**: Flags net-new tautological test assertions across worktree diffs and records vacuous_test_warn audit entries.
 - **Rust Never-Crash Trap Pack**: Enforces `TRAP-RS-003` and `TRAP-RS-004` on production Rust code with lazy inline `#[cfg(test)]` masking.
 - **Normalized Blocker Trap Harvesting**: Deduplicates recurring failure signatures in `.stigmerig/traps.json` and promotes persistent traps at three occurrences.
 - **Tier A and Tier B Schema Interoperability**: Reads flat or nested task files, normalizes event schemas, and isolates `--rig-dir` sandboxes.
@@ -176,11 +179,11 @@ StigmeRig enforces operational security and concurrency invariants across all wo
 Install StigmeRig directly from GitHub using pip or uv:
 
 ```bash
-pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.7"
+pip install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.8"
 ```
 
 ```bash
-uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.7"
+uv tool install "git+https://github.com/stigmerig-project/stigmerig.git@v0.1.8"
 ```
 
 Alternatively, clone the repository for editable local development:
@@ -317,12 +320,14 @@ results = runner.run_wave(
 )
 ```
 
-`WaveRunner` enforces four deterministic execution invariants:
+`WaveRunner` enforces six deterministic execution invariants:
 
 - **Bounded Concurrency**: Clamps `max_concurrency` to a ceiling of 5 tasks per wave (recommended 3 to 5).
 - **Isolated Task Branches**: Creates `.worktrees/<ID>` bound to branch `task/<ID>` before invoking the worker callback.
 - **Archetype Git Attribution**: Commits staged changes under `<Swarm> [<archetype>]` author metadata and `<Swarm> [orchestrator]` committer metadata.
 - **Safe Non-Fast-Forward Merge**: Verifies a clean worktree, merges with `git merge --no-ff`, or runs `git merge --abort` on conflict.
+- **Model Lineage and Diff Metrics**: Appends resolved `Model:` commit trailers and records `lines_added`, `lines_deleted`, `net_loc_delta`, and `files_deleted`.
+- **Worktree Test Diff Audits**: Logs `vacuous_test_warn` on net-new tautological test assertions and `scope_hygiene_warn` upon builder assertion deletions.
 
 ## Deterministic Telemetry and Trap Tracking
 
@@ -356,6 +361,8 @@ StigmeRig audits leaf tasks against four verify-only archetypes (`unit_tester`, 
 - **`review_wait_ratio`**: Measures time spent waiting in review compared to active implementation time.
 - **`review_bottleneck_alert`**: Triggers `true` when the review wait ratio exceeds healthy thresholds.
 - **`unverified_completion_rate`**: Audits tasks closed without explicit SHA-256 verification evidence.
+- **`tier_overprovisioned_count` and `tier_overprovisioned_alert`**: Flags verify-only leaf tasks executed on frontier models matching `frontier_model_tokens`.
+- **`subtractive_task_count` and `net_loc_delta_total`**: Aggregates `lines_added_total`, `lines_deleted_total`, `files_deleted_total`, and tasks reducing net lines of code (`net_loc_delta < 0`).
 
 ### Epic Wave Topology
 
@@ -436,7 +443,7 @@ Pass `--rig-dir <path>` before any subcommand to target an isolated `.stigmerig`
 | `stigmerig task create` | Register a task in `queue.db` and scaffold its Markdown context. | `--id`, `--title`, `--parent`, `--archetype`, `--priority`, `--tags`, `--author` |
 | `stigmerig task list` | Query tasks ordered by priority and creation timestamp. | `--status <todo\|working\|review\|done\|blocked>`, `--parent <id>` |
 | `stigmerig task get` | Inspect full JSON metadata for a single task. | `--id` |
-| `stigmerig task claim` | Acquire an atomic CAS task lease with expiration TTL. | `--id`, `--agent`, `--ttl <seconds>`, `--force-backpressure` |
+| `stigmerig task claim` | Acquire an atomic CAS task lease with expiration TTL. | `--id`, `--agent`, `--ttl <seconds>`, `--force-backpressure`, `--json` |
 | `stigmerig task review` | Submit a working task for review with receipts. | `--id`, `--agent`, `--summary`, `--verification-cmd`, `--diffstat`, `--evidence`, `--model` |
 | `stigmerig task approve` | Approve a reviewed task with an independent verifier and optional follow-ups. | `--id`, `--verifier`, `--session-id`, `--evidence`, `--model`, `--follow-up` |
 | `stigmerig task done` | Close a task after independent verification, spawn follow-ups, record advisory diff metrics, and compute next rail step. | `--id`, `--agent`, `--verifier`, `--session-id`, `--evidence`, `--model`, `--diffstat`, `--allow-self-approval`, `--follow-up` |
@@ -470,6 +477,25 @@ Newly initialized rigs scaffold `.stigmerig/rig.json` with default backpressure 
 ```
 
 Omitted keys disable each gate so existing rigs keep backward-compatible behavior until configured.
+
+Optional routing and evergreen freshness keys configure model lineage, tier alerts, and `traps freshness` floors:
+
+```json
+{
+  "archetype_models": {
+    "diff_synthesizer": "claude-sonnet-4-5",
+    "prose_auditor": "claude-haiku-4-5"
+  },
+  "frontier_model_tokens": ["opus", "gpt-5-pro", "o3-pro"],
+  "platform_targets": {
+    "python": "3.10"
+  },
+  "freshness": {
+    "stale_threshold_days": 180,
+    "protected_globs": ["**/migrations/**", "**/contracts/**"]
+  }
+}
+```
 
 ## Multi-Harness Integration Guide
 

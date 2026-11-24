@@ -24,6 +24,7 @@ from stigmerig.db import (
 from stigmerig.wave import (
     WaveRunner,
     WorktreeManager,
+    _detect_tautological_test_additions,
     _detect_test_assertion_deletions,
     _is_test_path,
 )
@@ -551,6 +552,143 @@ class TestReviewBackpressureAndFriction(unittest.TestCase):
                         wt_mgr.remove_worktree(tid, delete_branch=True)
                     except Exception:
                         pass
+                subprocess.run(["git", "worktree", "prune"], cwd=str(repo), capture_output=True)
+                gc.collect()
+
+    def test_detect_tautological_test_additions(self) -> None:
+        cases = [
+            ("tests/test_sample.py", "+    assert True"),
+            ("tests/test_sample.py", '+    assert True, "x"'),
+            ("tests/test_sample.py", "+    assert(True)"),
+            ("tests/test_sample.py", "+    self.assertTrue(True)"),
+            ("pkg/__tests__/auth.spec.ts", "+    expect(true).toBe(true)"),
+            ("tests/guard_test.rs", "+    assert!(true)"),
+        ]
+        for path, line in cases:
+            diff = "\n".join([
+                f"diff --git a/{path} b/{path}",
+                f"--- a/{path}",
+                f"+++ b/{path}",
+                "@@ -1,0 +1,1 @@",
+                line,
+            ])
+            self.assertEqual(_detect_tautological_test_additions(diff), [path], msg=line)
+
+        mixed_diff = "\n".join([
+            "diff --git a/tests/test_sample.py b/tests/test_sample.py",
+            "--- a/tests/test_sample.py",
+            "+++ b/tests/test_sample.py",
+            "@@ -1,1 +1,5 @@",
+            "+    assert True",
+            '+    assert True, "x"',
+            "+    assert(True)",
+            "+    self.assertTrue(True)",
+            "diff --git a/pkg/__tests__/auth.spec.ts b/pkg/__tests__/auth.spec.ts",
+            "--- a/pkg/__tests__/auth.spec.ts",
+            "+++ b/pkg/__tests__/auth.spec.ts",
+            "@@ -1,0 +1,1 @@",
+            "+    expect(true).toBe(true)",
+            "diff --git a/tests/guard_test.rs b/tests/guard_test.rs",
+            "--- a/tests/guard_test.rs",
+            "+++ b/tests/guard_test.rs",
+            "@@ -1,0 +1,1 @@",
+            "+    assert!(true)",
+            "diff --git a/src/app.py b/src/app.py",
+            "--- a/src/app.py",
+            "+++ b/src/app.py",
+            "@@ -1,0 +1,1 @@",
+            "+assert True",
+            "diff --git a/tests/test_deleted.py b/tests/test_deleted.py",
+            "--- a/tests/test_deleted.py",
+            "+++ b/tests/test_deleted.py",
+            "@@ -1,1 +1,0 @@",
+            "-    assert True",
+            "diff --git a/tests/test_clean.py b/tests/test_clean.py",
+            "--- a/tests/test_clean.py",
+            "+++ b/tests/test_clean.py",
+            "@@ -1,0 +1,4 @@",
+            "+    assert True == value",
+            "+    assert result == 42",
+            "+    self.assertTrue(ok)",
+            "+    assert 1 == 1",
+        ])
+        self.assertEqual(
+            _detect_tautological_test_additions(mixed_diff),
+            ["pkg/__tests__/auth.spec.ts", "tests/guard_test.rs", "tests/test_sample.py"],
+        )
+
+    def test_wave_runner_logs_vacuous_test_warn_for_unit_tester(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test Runner"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "user.email", "runner@local.test"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=str(repo), check=True)
+            (repo / "tests").mkdir()
+            (repo / "tests" / "test_auth.py").write_text(
+                "def test_ok():\n    assert 1 == 1\n    assert 2 == 2\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "tests/test_auth.py"], cwd=str(repo), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init tests"], cwd=str(repo), check=True, capture_output=True)
+
+            db = StigmeRigDB(rig_dir=repo / ".stigmerig", workspace_root=repo)
+            db.init_rig(scaffold_icm=False)
+            (repo / ".stigmerig" / "rig.json").write_text(
+                json.dumps({
+                    "version": "0.1.0",
+                    "max_pending_review": 3,
+                    "high_friction_tags": ["security", "infra"],
+                }, indent=2),
+                encoding="utf-8",
+            )
+            wt_mgr = WorktreeManager(repo_root=repo)
+            runner = WaveRunner(db=db, worktree_mgr=wt_mgr)
+            evidence = repo / "proof.log"
+            evidence.write_text("targeted check ok\n", encoding="utf-8")
+
+            try:
+                db.create_task("TASK-906", "Unit tester adds vacuous test")
+
+                def append_vacuous_test(exec_dir: Path) -> bool:
+                    target = exec_dir / "tests" / "test_auth.py"
+                    existing = target.read_text(encoding="utf-8")
+                    target.write_text(
+                        existing + "def test_vacuous():\n    assert True\n",
+                        encoding="utf-8",
+                    )
+                    return True
+
+                err_buf = io.StringIO()
+                with contextlib.redirect_stderr(err_buf):
+                    ok, msg = runner.run_task_in_worktree(
+                        task_id="TASK-906",
+                        agent="tester-1",
+                        action_fn=append_vacuous_test,
+                        archetype="unit_tester",
+                        allow_self_approval=True,
+                        evidence_paths=[evidence],
+                    )
+                self.assertTrue(ok, msg)
+                stderr_text = err_buf.getvalue()
+                self.assertIn("added tautological test assertions", stderr_text)
+                self.assertIn("tests/test_auth.py", stderr_text)
+
+                with db.get_audit_conn() as aconn:
+                    rows = aconn.execute(
+                        "SELECT task_id, action, verification_status FROM audit_log WHERE action = 'vacuous_test_warn'"
+                    ).fetchall()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["task_id"], "TASK-906")
+                self.assertEqual(rows[0]["verification_status"], "warn")
+                audit_ok, audit_msg = db.verify_audit_chain()
+                self.assertTrue(audit_ok, audit_msg)
+            finally:
+                try:
+                    wt_mgr.remove_worktree("TASK-906", delete_branch=True)
+                except Exception:
+                    pass
                 subprocess.run(["git", "worktree", "prune"], cwd=str(repo), capture_output=True)
                 gc.collect()
 

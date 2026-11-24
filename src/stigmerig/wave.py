@@ -151,6 +151,39 @@ def _detect_test_assertion_deletions(diff_text: str) -> List[str]:
     return sorted(flagged)
 
 
+_TAUTOLOGICAL_ASSERTION_RE: re.Pattern[str] = re.compile(
+    r"^(?:assert\s+True\s*(?:,|#|$)|assert\s*\(\s*True\s*\)\s*(?:,|#|$)|self\.assertTrue\(\s*True\s*\)"
+    r"|expect\(\s*true\s*\)\.toBe\(\s*true\s*\)|assert!\(\s*true\s*\))"
+)
+
+
+def _detect_tautological_test_additions(diff_text: str) -> List[str]:
+    """Return sorted test file paths whose unified diff adds tautological assertion lines."""
+    flagged: set[str] = set()
+    old_path: Optional[str] = None
+    cur_path: Optional[str] = None
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            old_path = None
+            cur_path = None
+        elif line.startswith("--- "):
+            raw_old = line[4:].strip()
+            if raw_old.startswith("a/"):
+                raw_old = raw_old[2:]
+            old_path = None if raw_old == "/dev/null" else raw_old
+        elif line.startswith("+++ "):
+            raw_new = line[4:].strip()
+            if raw_new.startswith("b/"):
+                raw_new = raw_new[2:]
+            new_path = None if raw_new == "/dev/null" else raw_new
+            cur_path = new_path or old_path
+        elif cur_path and _is_test_path(cur_path) and line.startswith("+") and not line.startswith("+++"):
+            added = line[1:].lstrip()
+            if _TAUTOLOGICAL_ASSERTION_RE.match(added):
+                flagged.add(cur_path)
+    return sorted(flagged)
+
+
 _REPO_LOCKS_GUARD = threading.Lock()
 _REPO_LOCKS: Dict[str, threading.RLock] = {}
 
@@ -632,11 +665,7 @@ class WaveRunner:
                             with self._db_lock:
                                 self.db.fail_task(task_id, agent=agent, reason=friction_err)
                             return False, friction_err
-                    if (
-                        friction_triggered
-                        and arch.strip().lower() != "unit_tester"
-                        and any(_is_test_path(p) for p in touched_paths)
-                    ):
+                    if any(_is_test_path(p) for p in touched_paths):
                         cached_u0_proc = subprocess.run(
                             ["git", "diff", "--cached", "-U0", "--", ".", *_WORKTREE_EXCLUDE_PATHSPECS],
                             cwd=str(worktree_path),
@@ -650,23 +679,41 @@ class WaveRunner:
                             ("-U0",),
                             f"refs/heads/{target_branch}...{expected_ref}",
                         ) or ""
-                        flagged_tests = sorted(
-                            set(_detect_test_assertion_deletions(cached_u0))
-                            | set(_detect_test_assertion_deletions(branch_u0))
+                        vacuous_tests = sorted(
+                            set(_detect_tautological_test_additions(cached_u0))
+                            | set(_detect_tautological_test_additions(branch_u0))
                         )
-                        if flagged_tests:
+                        if vacuous_tests:
                             print(
-                                f"Warning: high-friction task '{task_id}' ({arch}) modified or removed test assertions in: {', '.join(flagged_tests)}",
+                                f"Warning: task '{task_id}' ({arch}) added tautological test assertions in: {', '.join(vacuous_tests)}",
                                 file=sys.stderr,
                             )
                             with self._db_lock:
                                 self.db.log_audit(
                                     task_id=task_id,
-                                    action="scope_hygiene_warn",
+                                    action="vacuous_test_warn",
                                     agent=agent,
                                     verification_status="warn",
-                                    payload=json.dumps({"archetype": arch, "test_files": flagged_tests}),
+                                    payload=json.dumps({"archetype": arch, "test_files": vacuous_tests}),
                                 )
+                        if friction_triggered and arch.strip().lower() != "unit_tester":
+                            flagged_tests = sorted(
+                                set(_detect_test_assertion_deletions(cached_u0))
+                                | set(_detect_test_assertion_deletions(branch_u0))
+                            )
+                            if flagged_tests:
+                                print(
+                                    f"Warning: high-friction task '{task_id}' ({arch}) modified or removed test assertions in: {', '.join(flagged_tests)}",
+                                    file=sys.stderr,
+                                )
+                                with self._db_lock:
+                                    self.db.log_audit(
+                                        task_id=task_id,
+                                        action="scope_hygiene_warn",
+                                        agent=agent,
+                                        verification_status="warn",
+                                        payload=json.dumps({"archetype": arch, "test_files": flagged_tests}),
+                                    )
                     diff_proc = subprocess.run(
                         ["git", "diff", "--cached", "--quiet"],
                         cwd=str(worktree_path),

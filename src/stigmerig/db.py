@@ -59,7 +59,7 @@ HIGH_FRICTION_PR_RUBRIC: Tuple[str, ...] = (
     "PR Rubric [root_cause]: Verify the change resolves the underlying root cause rather than masking symptoms.",
     "PR Rubric [edge_cases]: Verify boundary inputs, empty states, and error paths are handled.",
     "PR Rubric [scope_hygiene]: Enforce minimal diff scope with zero edits to existing test assertions.",
-    "PR Rubric [verification]: Cite targeted test command output and pass/fail counts as --evidence.",
+    "PR Rubric [verification]: Show targeted checks fail before the change and pass after it, or state why no pre-change failure exists. Cite pass/fail counts as --evidence.",
 )
 
 
