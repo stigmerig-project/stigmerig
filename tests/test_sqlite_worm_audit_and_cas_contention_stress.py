@@ -94,15 +94,15 @@ def test_derive_seat_precedence_and_cross_delimiter_self_approval_hashes(tmp_pat
     assert (derive_seat("s/u@h:r"), derive_seat("u@h:r"), derive_seat("c:w"), derive_seat(" solo "), derive_seat(None), derive_seat("")) == ("s", "u", "c", "solo", "default", "default")
     for env_key, env_val, exp in [("SEAT", " env-low ", "env-low"), ("AGENT_SEAT", " env-mid ", "env-mid"), ("STIGMERIG_SEAT", " env-top ", "env-top")]:
         monkeypatch.setenv(env_key, env_val); assert derive_seat("s/u@h:r") == exp
-    assert all(_is_self_approval(a, v) is True for a, v in [("seat/a", "seat:b"), ("seat/a", "SEAT@b"), ("user@host", "USER"), ("USER", "team:user"), ("org/shared", "dept:SHARED")])
-    assert all(_is_self_approval(a, v) is False for a, v in [("seat-a/a", "seat-b:b"), ("user1@h1", "user2@h2"), ("solo-a", "solo-b"), (None, "rev"), ("act", "")])
+    assert all(_is_self_approval(a, v) is True for a, v in [("seat/a", "role:a"), ("seat/a", "A@b"), ("user@host", "USER"), ("USER", "team:user"), ("org/shared", "dept:SHARED")])
+    assert all(_is_self_approval(a, v) is False for a, v in [("claude:alpha", "claude:beta"), ("alice@host", "bob@host"), ("seat-a/a", "seat-b:b"), ("solo-a", "solo-b"), (None, "rev"), ("act", "")])
     db, expected = StigmeRigDB(rig_dir=tmp_path / "seat_rig"), {}; db.init_rig(scaffold_icm=False)
-    matrix = [("TSK-ST-1", {"STIGMERIG_SEAT": "env-top", "AGENT_SEAT": "env-mid", "SEAT": "env-low"}, "seat/a", ("seat:b", "SEAT@c", "A"), "qa-team:rev-1", False, "env-top"),
-              ("TSK-ST-2", {"AGENT_SEAT": "env-mid", "SEAT": "env-low"}, "user@host:dev", ("USER", "dev@node"), "indep@verify", False, "env-mid"),
-              ("TSK-ST-3", {"SEAT": "env-low"}, "colon-s:worker", ("COLON-S/x", "worker@y"), "auditor/lead", False, "env-low"),
-              ("TSK-ST-4", {}, "slash-s/dev@host:tag", ("slash-s:qa", "qa/tag"), "gatekeeper:ok", False, "slash-s"),
-              ("TSK-ST-5", {}, "at-s@host:tag", ("AT-S:qa", "tag/qa"), "external/rev", False, "at-s"),
-              ("TSK-ST-6", {}, "colon-only:dev", ("dev", "colon-only/qa"), None, True, "colon-only")]
+    matrix = [("TSK-ST-1", {"STIGMERIG_SEAT": "env-top", "AGENT_SEAT": "env-mid", "SEAT": "env-low"}, "seat/a", ("role:a", "A@host", "A"), "seat:b", False, "env-top"),
+              ("TSK-ST-2", {"AGENT_SEAT": "env-mid", "SEAT": "env-low"}, "dev@host", ("DEV", "team:dev@node"), "indep@host", False, "env-mid"),
+              ("TSK-ST-3", {"SEAT": "env-low"}, "claude:alpha", ("seat/ALPHA", "alpha@y"), "claude:beta", False, "env-low"),
+              ("TSK-ST-4", {}, "slash-s/dev@host", ("qa:dev", "DEV@other"), "slash-s:qa", False, "slash-s"),
+              ("TSK-ST-5", {}, "at-s@host", ("AT-S", "team/at-s@node"), "other@host", False, "at-s"),
+              ("TSK-ST-6", {}, "colon-only:dev", ("dev", "team/dev@h"), None, True, "colon-only")]
     for tid, env_map, agent, bad_verifiers, valid_verifier, allow_self, seat in matrix:
         for k in SEAT_ENV_KEYS: monkeypatch.setenv(k, env_map[k]) if k in env_map else monkeypatch.delenv(k, raising=False)
         db.create_task(tid, f"Seat matrix {tid}"); assert db.claim_task(tid, agent=agent, ttl_seconds=600) is True
@@ -115,3 +115,30 @@ def test_derive_seat_precedence_and_cross_delimiter_self_approval_hashes(tmp_pat
         aud_rows = {r["task_id"]: dict(r) for r in aconn.execute("SELECT task_id, payload_hash, verification_status FROM audit_log WHERE action = 'task_completed'")}
     assert len(ev_rows) == 6 and len(aud_rows) == 6 and db.verify_audit_chain()[0] is True
     assert all(json.loads(ev_rows[t]) == expected[t][0] and aud_rows[t]["payload_hash"] == expected[t][1] == hashlib.sha256(ev_rows[t].encode("utf-8")).hexdigest() for t in expected)
+
+
+def test_coupled_queue_and_audit_rollback_on_audit_abort(tmp_path: Path) -> None:
+    db = StigmeRigDB(rig_dir=tmp_path / "coupled_rig"); db.init_rig(scaffold_icm=False)
+
+    def _counts() -> tuple[int, int, int]:
+        with db.get_queue_conn() as qconn, db.get_audit_conn() as aconn:
+            return (qconn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], qconn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0], aconn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0])
+
+    db.create_task("TSK-ABT-1", "Coupled abort test"); assert db.claim_task("TSK-ABT-1", "dev") is True
+    base_counts = _counts()
+    with db.get_audit_conn() as aconn:
+        aconn.execute("CREATE TRIGGER block_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;"); aconn.commit()
+    with pytest.raises(sqlite3.DatabaseError, match="injected audit failure"):
+        db.complete_task("TSK-ABT-1", "dev", verifier="rev")
+    assert db.get_task("TSK-ABT-1")["status"] == "working" and _counts() == base_counts
+    with db.get_audit_conn() as aconn:
+        aconn.execute("DROP TRIGGER block_audit"); aconn.commit()
+    assert db.complete_task("TSK-ABT-1", "dev", verifier="rev")[0] is True and db.verify_audit_chain()[0] is True
+    done_counts = _counts()
+    with pytest.raises(sqlite3.IntegrityError, match="already exists"):
+        db.create_task("TSK-ABT-1", "dup")
+    assert _counts() == done_counts
+    db.create_task("TSK-ABT-2", "Coupled fail test"); assert db.claim_task("TSK-ABT-2", "owner") is True
+    with pytest.raises(PermissionError, match="actively leased"):
+        db.fail_task("TSK-ABT-2", "intruder", "nope")
+    assert db.verify_audit_chain()[0] is True

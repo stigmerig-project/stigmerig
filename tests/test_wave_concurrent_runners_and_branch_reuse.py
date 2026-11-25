@@ -105,7 +105,7 @@ def test_seat_component_self_approval_preclaim_rejection_and_handoff(release_rig
     for tid, arch in (("TSK-SELF", "policy_gatekeeper"), ("TSK-HAND", "unit_tester")):
         db.create_task(tid, f"Task {tid}", author="Arch", archetype=arch)
     runner_a, runner_b, bad_calls, bar = WaveRunner(db=db, worktree_mgr=wt_mgr), WaveRunner(db=db, worktree_mgr=wt_mgr), [], threading.Barrier(2, timeout=5.0)
-    specs_a = [{"task_id": tid, "agent": "seat/dev", "verifier": "seat:qa", "action": lambda wt: bad_calls.append(wt) or True} for tid in ("TSK-SELF", "TSK-HAND")]
+    specs_a = [{"task_id": tid, "agent": "dev/seat", "verifier": "qa:seat", "action": lambda wt: bad_calls.append(wt) or True} for tid in ("TSK-SELF", "TSK-HAND")]
     specs_b = [{"task_id": "TSK-HAND", "agent": "ops/worker", "verifier": "qa:lead", "archetype": "unit_tester", "action": lambda wt: (wt / "hand.txt").write_text("ok\n", encoding="utf-8") is not None}]
     with ThreadPoolExecutor(max_workers=2) as pool:
         res_a, res_b = [f.result() for f in (pool.submit(lambda: (bar.wait(), runner_a.run_wave(specs_a, max_concurrency=2))[1]), pool.submit(lambda: (bar.wait(), runner_b.run_wave(specs_b, max_concurrency=1))[1]))]

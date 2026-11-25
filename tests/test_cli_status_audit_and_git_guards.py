@@ -49,7 +49,7 @@ def test_crlf_audit_colon_status_and_upfront_verifier_gates(rig_dir: Path, monke
         ["audit", "log", "--task", "TSK-1", "--action", "act", "--agent", "W", "--status", "bad:st"],
         *(["task", "list", "--status", s] for s in ("invalid", "pending", "TODO", "in_progress", "done:1", "todo\n")),
         ["task", "done", "--id", "TSK-1", "--agent", "WorkerA"],
-        *(["task", "done", "--id", "TSK-1", "--agent", a, "--verifier", v] for a, v in (("WorkerA", "WorkerA"), ("WorkerA", "workera"), ("s/A", "s/B"), ("A@h", "A"), ("s:A", "s"))),
+        *(["task", "done", "--id", "TSK-1", "--agent", a, "--verifier", v] for a, v in (("WorkerA", "WorkerA"), ("WorkerA", "workera"), ("role/A", "seat:A"), ("A@h", "A"), ("s:A", "A"))),
     ]
     with monkeypatch.context() as mp:
         mp.setattr(cli, "StigmeRigDB", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("DB accessed")))

@@ -181,13 +181,23 @@ class TestReviewBackpressureAndFriction(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.db.approve_review("TASK-200", "builder-a")
         with self.assertRaises(PermissionError):
-            self.db.approve_review("TASK-200", "builder-a/reviewer")
+            self.db.approve_review("TASK-200", "reviewer/builder-a")
 
         # Independent verifier succeeds
         ok, msg = self.db.approve_review("TASK-200", "verifier-z", session_id="rev-1")
         self.assertTrue(ok, msg)
         self.assertEqual(self.db.get_task("TASK-200")["status"], "done")
         self.assertNotIn("Pending Review / Verification", self.db.board_path.read_text(encoding="utf-8"))
+
+        # Slashed verifier leaf matching implementer is rejected; distinct peer passes
+        self.db.create_task("TASK-203", "Slashed identity review")
+        self.assertTrue(self.db.claim_task("TASK-203", "claude:alpha"))
+        ok, _ = self.db.submit_for_review("TASK-203", "claude:alpha", "ready")
+        self.assertTrue(ok)
+        with self.assertRaises(PermissionError):
+            self.db.approve_review("TASK-203", "team/claude:alpha")
+        ok, msg = self.db.approve_review("TASK-203", "claude:beta")
+        self.assertTrue(ok, msg)
 
         # Pre-review implementer history across handoff & blocked reset
         self.db.create_task("TASK-202", "Multi-implementer task")

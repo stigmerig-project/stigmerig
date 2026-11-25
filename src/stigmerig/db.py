@@ -16,7 +16,7 @@ import stat
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from stigmerig.traps import trap_file_lock
 
@@ -458,8 +458,15 @@ def resolve_model_id(model_id: Optional[str] = None) -> Optional[str]:
     return _validate_model_string(env_model, "STIGMERIG_MODEL")
 
 
+def _extract_agent_principal(ident: str) -> str:
+    """Extract normalized leaf principal token from an agent identity string."""
+    cleaned = ident.strip().lower().split("@", 1)[0]
+    parts = [p for p in re.split(r"[/:]+", cleaned) if p]
+    return parts[-1] if parts else ""
+
+
 def _is_self_approval(actor: Optional[str], verifier: Optional[str]) -> bool:
-    """Check if verifier matches actor identity or base seat/agent components."""
+    """Check if verifier matches actor identity or leaf agent principal."""
     if not actor or not verifier:
         return False
     actor_str = str(actor).strip()
@@ -470,23 +477,9 @@ def _is_self_approval(actor: Optional[str], verifier: Optional[str]) -> bool:
     if actor_str.lower() == verifier_str.lower():
         return True
 
-    actor_parts = set()
-    verifier_parts = set()
-    for sep in ("/", "@", ":"):
-        if sep in actor_str:
-            actor_parts.update(p.strip().lower() for p in actor_str.split(sep) if p.strip())
-        if sep in verifier_str:
-            verifier_parts.update(p.strip().lower() for p in verifier_str.split(sep) if p.strip())
-
-    if actor_parts and verifier_parts:
-        if actor_parts & verifier_parts:
-            return True
-    elif actor_parts and verifier_str.lower() in actor_parts:
-        return True
-    elif verifier_parts and actor_str.lower() in verifier_parts:
-        return True
-
-    return False
+    pa = _extract_agent_principal(actor_str)
+    pv = _extract_agent_principal(verifier_str)
+    return bool(pa) and pa == pv
 
 
 def utc_now_iso() -> str:
@@ -1040,6 +1033,110 @@ class StigmeRigDB:
             if not row or "VIRTUAL TABLE" in (row["sql"] or "").upper():
                 raise sqlite3.OperationalError("audit_log must be a non-virtual base table")
 
+    def _run_coupled_queue_audit_tx(
+        self,
+        queue_fn: Callable[[sqlite3.Connection, str], Optional[List[Tuple[str, str, str, str, str]]]],
+        now: Optional[str] = None,
+    ) -> Tuple[bool, List[str]]:
+        """Execute queue mutations and chained audit inserts in one attached transaction.
+
+        Provides single-connection runtime atomicity across queue.db and audit.db;
+        note that SQLite per-file WAL durability limits still apply under sudden power loss.
+        """
+        tx_now = now or utc_now_iso()
+        with self._lock:
+            if not self.queue_db_path.is_file():
+                raise FileNotFoundError(f"Uninitialized queue database: {self.queue_db_path}; run 'stigmerig init'")
+            if not self.audit_db_path.is_file():
+                raise FileNotFoundError(f"Uninitialized audit database: {self.audit_db_path}")
+
+            conn = sqlite3.connect(str(self.queue_db_path), timeout=10.0, isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA journal_mode = WAL;")
+                conn.execute("PRAGMA synchronous = NORMAL;")
+                conn.execute("PRAGMA busy_timeout = 5000;")
+                conn.execute("ATTACH DATABASE ? AS audit_db", (str(self.audit_db_path),))
+                conn.execute("PRAGMA audit_db.synchronous = NORMAL;")
+                conn.execute("BEGIN IMMEDIATE;")
+
+                q_rows = {
+                    r["name"]: r["sql"] or ""
+                    for r in conn.execute(
+                        "SELECT name, sql FROM main.sqlite_master WHERE type='table' AND name IN ('tasks', 'task_events')"
+                    )
+                }
+                if any(
+                    t not in q_rows or re.search(r"\bVIRTUAL\s+TABLE\b", q_rows[t], re.IGNORECASE)
+                    for t in ("tasks", "task_events")
+                ):
+                    raise sqlite3.OperationalError("tasks and task_events must be non-virtual base tables")
+
+                a_row = conn.execute(
+                    "SELECT sql FROM audit_db.sqlite_master WHERE type='table' AND name='audit_log'"
+                ).fetchone()
+                if not a_row or re.search(r"\bVIRTUAL\s+TABLE\b", a_row["sql"] or "", re.IGNORECASE):
+                    raise sqlite3.OperationalError("audit_log must be a non-virtual base table")
+
+                audit_specs = queue_fn(conn, tx_now)
+                if audit_specs is None:
+                    conn.execute("ROLLBACK;")
+                    return False, []
+
+                row = conn.execute("SELECT entry_hash FROM audit_db.audit_log ORDER BY id DESC LIMIT 1").fetchone()
+                previous_hash = row["entry_hash"] if row else GENESIS_HASH
+                hashes: List[str] = []
+
+                for aud_task_id, action, aud_agent, verification_status, payload_str in audit_specs:
+                    self._validate_task_id(aud_task_id)
+                    header_err = _validate_audit_header_fields(aud_task_id, action, aud_agent, verification_status)
+                    if header_err is not None or not isinstance(payload_str, str):
+                        raise ValueError(header_err or "payload must be a string")
+
+                    payload_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+                    raw_header = (
+                        f"{tx_now}:{aud_task_id}:{action}:{aud_agent}:"
+                        f"{verification_status}:{payload_hash}:{previous_hash}"
+                    )
+                    entry_hash = hashlib.sha256(raw_header.encode("utf-8")).hexdigest()
+
+                    conn.execute(
+                        """
+                        INSERT INTO audit_db.audit_log (
+                            timestamp, task_id, action, agent,
+                            verification_status, payload_hash, previous_hash, entry_hash
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            tx_now,
+                            aud_task_id,
+                            action,
+                            aud_agent,
+                            verification_status,
+                            payload_hash,
+                            previous_hash,
+                            entry_hash,
+                        ),
+                    )
+                    previous_hash = entry_hash
+                    hashes.append(entry_hash)
+
+                conn.execute("COMMIT;")
+                return True, hashes
+            except BaseException:
+                if conn.in_transaction:
+                    try:
+                        conn.execute("ROLLBACK;")
+                    except sqlite3.Error:
+                        pass
+                raise
+            finally:
+                try:
+                    conn.execute("DETACH DATABASE audit_db")
+                except sqlite3.Error:
+                    pass
+                conn.close()
+
     def _validate_task_id(self, task_id: str) -> str:
         """Validate task identifier syntax preventing directory traversal."""
         if not isinstance(task_id, str) or not TASK_ID_PATTERN.fullmatch(task_id):
@@ -1106,7 +1203,7 @@ class StigmeRigDB:
             raise ValueError(f"Task file traversal detected: '{task_file}' escapes '{tasks_root}'")
         context_path = str(resolved_file.relative_to(self.rig_dir.parent.resolve()))
 
-        with self.get_queue_conn() as conn:
+        def _queue_fn(conn: sqlite3.Connection, tx_now: str) -> List[Tuple[str, str, str, str, str]]:
             try:
                 conn.execute(
                     """
@@ -1116,7 +1213,7 @@ class StigmeRigDB:
                         parent_id, tags, author, archetype
                     ) VALUES (?, ?, 'todo', ?, ?, ?, NULL, NULL, 0, ?, ?, ?, ?, ?)
                     """,
-                    (task_id, title, priority, now, now, context_path, parent_id, tags, author, archetype),
+                    (task_id, title, priority, tx_now, tx_now, context_path, parent_id, tags, author, archetype),
                 )
             except sqlite3.IntegrityError as exc:
                 if "tasks.id" in str(exc) or getattr(exc, "sqlite_errorname", "") == "SQLITE_CONSTRAINT_PRIMARYKEY":
@@ -1127,9 +1224,19 @@ class StigmeRigDB:
                 INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
                 VALUES (?, 'created', ?, ?, ?)
                 """,
-                (task_id, author or "system", json.dumps({"title": title, "archetype": archetype}), now),
+                (task_id, author or "system", json.dumps({"title": title, "archetype": archetype}), tx_now),
             )
-            conn.commit()
+            return [
+                (
+                    task_id,
+                    "task_created",
+                    author or "system",
+                    "unverified",
+                    json.dumps({"title": title, "parent_id": parent_id}),
+                )
+            ]
+
+        self._run_coupled_queue_audit_tx(_queue_fn, now=now)
 
         if not task_file.exists():
             task_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1147,13 +1254,6 @@ Add task details and acceptance criteria here.
 """
             task_file.write_text(scaffold, encoding="utf-8")
 
-        self.log_audit(
-            task_id=task_id,
-            action="task_created",
-            agent=author or "system",
-            verification_status="unverified",
-            payload=json.dumps({"title": title, "parent_id": parent_id}),
-        )
         self.sync_board()
         return self.get_task(task_id) or {}
 
@@ -1262,7 +1362,7 @@ Add task details and acceptance criteria here.
             backpressure_clause = "AND (status = 'working' OR (SELECT COUNT(*) FROM tasks WHERE status = 'review') < ?)"
             update_params.append(max_pending_review)
 
-        with self.get_queue_conn() as conn:
+        def _queue_fn(conn: sqlite3.Connection, tx_now: str) -> Optional[List[Tuple[str, str, str, str, str]]]:
             cur = conn.cursor()
             cur.execute(
                 f"""
@@ -1285,25 +1385,28 @@ Add task details and acceptance criteria here.
                 """,
                 tuple(update_params),
             )
-            success = cur.rowcount == 1
-            if success:
-                conn.execute(
-                    """
-                    INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
-                    VALUES (?, 'claimed', ?, ?, ?)
-                    """,
-                    (task_id, agent, json.dumps({"lease_until": lease_until_str}), now_str),
-                )
-                conn.commit()
-
-        if success:
-            self.log_audit(
-                task_id=task_id,
-                action="task_claimed",
-                agent=agent.replace("\r", " ").replace("\n", " "),
-                verification_status="in_progress",
-                payload=json.dumps({"lease_until": lease_until_str}),
+            if cur.rowcount != 1:
+                return None
+            payload_json = json.dumps({"lease_until": lease_until_str})
+            conn.execute(
+                """
+                INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
+                VALUES (?, 'claimed', ?, ?, ?)
+                """,
+                (task_id, agent, payload_json, tx_now),
             )
+            return [
+                (
+                    task_id,
+                    "task_claimed",
+                    agent.replace("\r", " ").replace("\n", " "),
+                    "in_progress",
+                    payload_json,
+                )
+            ]
+
+        success, _ = self._run_coupled_queue_audit_tx(_queue_fn, now=now_str)
+        if success:
             self.sync_board()
         return success
 
@@ -1579,33 +1682,57 @@ Add task details and acceptance criteria here.
         origin_parent_id = task.get("parent_id")
         created_fu_records: List[Tuple[str, str, Path]] = []
 
-        with self.get_queue_conn() as conn:
+        def _queue_fn(conn: sqlite3.Connection, tx_now: str) -> Optional[List[Tuple[str, str, str, str, str]]]:
             cur = conn.cursor()
             cur.execute(cas_sql, cas_params)
             if cur.rowcount != 1:
-                return False, cas_fail_msg
+                return None
 
             if norm_follow_ups:
-                created_fu_records = self._insert_follow_up_tasks(
+                inserted = self._insert_follow_up_tasks(
                     conn,
                     origin_task_id=task_id,
                     origin_parent_id=origin_parent_id,
                     fu_author=fu_author,
                     follow_ups=norm_follow_ups,
-                    now=now,
+                    now=tx_now,
                 )
+                created_fu_records.extend(inserted)
                 created_fu_ids = [fu_id for fu_id, _, _ in created_fu_records]
                 if created_fu_ids:
                     event_payload["follow_up_ids"] = list(created_fu_ids)
 
+            payload_json = json.dumps(event_payload)
             conn.execute(
                 """
                 INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
                 VALUES (?, 'completed', ?, ?, ?)
                 """,
-                (task_id, event_agent, json.dumps(event_payload), now),
+                (task_id, event_agent, payload_json, tx_now),
             )
-            conn.commit()
+
+            audit_specs: List[Tuple[str, str, str, str, str]] = [
+                (task_id, "task_completed", audit_agent, verification_status, payload_json)
+            ]
+            fu_audit_author = fu_author.replace("\r", " ").replace("\n", " ").strip()
+            for fu_id, fu_title, _ in created_fu_records:
+                audit_specs.append((
+                    fu_id,
+                    "task_created",
+                    fu_audit_author,
+                    "unverified",
+                    json.dumps({
+                        "title": fu_title,
+                        "parent_id": None,
+                        "origin_task_id": task_id,
+                        "origin_parent_id": origin_parent_id,
+                    }),
+                ))
+            return audit_specs
+
+        ok, _ = self._run_coupled_queue_audit_tx(_queue_fn, now=now)
+        if not ok:
+            return False, cas_fail_msg
 
         for fu_id, fu_title, fu_file in created_fu_records:
             if not fu_file.exists() and not _is_link_or_junction(fu_file):
@@ -1621,29 +1748,6 @@ Add task details and acceptance criteria here.
                     f"Follow-up task spawned from {task_id}.\n"
                 )
                 _atomic_write_text(fu_file, scaffold)
-
-        self.log_audit(
-            task_id=task_id,
-            action="task_completed",
-            agent=audit_agent,
-            verification_status=verification_status,
-            payload=json.dumps(event_payload),
-        )
-
-        fu_audit_author = fu_author.replace("\r", " ").replace("\n", " ").strip()
-        for fu_id, fu_title, _ in created_fu_records:
-            self.log_audit(
-                task_id=fu_id,
-                action="task_created",
-                agent=fu_audit_author,
-                verification_status="unverified",
-                payload=json.dumps({
-                    "title": fu_title,
-                    "parent_id": None,
-                    "origin_task_id": task_id,
-                    "origin_parent_id": origin_parent_id,
-                }),
-            )
 
         if follow_up_ids_out is not None and created_fu_records:
             follow_up_ids_out.extend(fu_id for fu_id, _, _ in created_fu_records)
@@ -1859,7 +1963,10 @@ Add task details and acceptance criteria here.
             event_payload["evidence"] = evidence_records
 
         version = task.get("version", 0)
-        with self.get_queue_conn() as conn:
+        cas_lost = False
+
+        def _queue_fn(conn: sqlite3.Connection, tx_now: str) -> Optional[List[Tuple[str, str, str, str, str]]]:
+            nonlocal cas_lost
             cur = conn.cursor()
             cur.execute(
                 """
@@ -1874,27 +1981,34 @@ Add task details and acceptance criteria here.
                   AND version = ?
                   AND (lease_until IS NULL OR lease_until >= ?)
                 """,
-                (now, task_id, agent, version, now),
+                (tx_now, task_id, agent, version, tx_now),
             )
             if cur.rowcount != 1:
-                return False, f"Concurrent modification detected or lease lost on task '{task_id}' (expected version {version})"
+                cas_lost = True
+                return None
 
+            payload_json = json.dumps(event_payload)
             conn.execute(
                 """
                 INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
                 VALUES (?, 'review_submitted', ?, ?, ?)
                 """,
-                (task_id, agent, json.dumps(event_payload), now),
+                (task_id, agent, payload_json, tx_now),
             )
-            conn.commit()
+            return [
+                (
+                    task_id,
+                    "task_review_submitted",
+                    agent.replace("\r", " ").replace("\n", " "),
+                    "pending_review",
+                    payload_json,
+                )
+            ]
 
-        self.log_audit(
-            task_id=task_id,
-            action="task_review_submitted",
-            agent=agent.replace("\r", " ").replace("\n", " "),
-            verification_status="pending_review",
-            payload=json.dumps(event_payload),
-        )
+        ok, _ = self._run_coupled_queue_audit_tx(_queue_fn, now=now)
+        if not ok or cas_lost:
+            return False, f"Concurrent modification detected or lease lost on task '{task_id}' (expected version {version})"
+
         self.sync_board()
         return True, "Task submitted for review"
 
@@ -2151,7 +2265,7 @@ Add task details and acceptance criteria here.
                 f"Task '{task_id}' is actively leased by '{claimed_by}'; '{agent}' cannot fail it."
             )
 
-        with self.get_queue_conn() as conn:
+        def _queue_fn(conn: sqlite3.Connection, tx_now: str) -> List[Tuple[str, str, str, str, str]]:
             cur = conn.cursor()
             if task["status"] == "todo" and task.get("claimed_by") is None:
                 cur.execute(
@@ -2166,7 +2280,7 @@ Add task details and acceptance criteria here.
                       AND status = 'todo'
                       AND claimed_by IS NULL
                     """,
-                    (now, task_id, expected_version),
+                    (tx_now, task_id, expected_version),
                 )
             else:
                 cur.execute(
@@ -2187,7 +2301,7 @@ Add task details and acceptance criteria here.
                           AND (lease_until IS NULL OR TRIM(lease_until) = '' OR lease_until >= ?)
                       )
                     """,
-                    (now, task_id, expected_version, agent, now),
+                    (tx_now, task_id, expected_version, agent, tx_now),
                 )
 
             if cur.rowcount != 1:
@@ -2195,22 +2309,17 @@ Add task details and acceptance criteria here.
                     f"Concurrent modification detected on task '{task_id}' (expected version {expected_version})."
                 )
 
+            payload_json = json.dumps({"reason": reason})
             conn.execute(
                 """
                 INSERT INTO task_events (task_id, event_type, agent, payload, timestamp)
                 VALUES (?, 'blocked', ?, ?, ?)
                 """,
-                (task_id, agent, json.dumps({"reason": reason}), now),
+                (task_id, agent, payload_json, tx_now),
             )
-            conn.commit()
+            return [(task_id, "task_blocked", agent, "failed", payload_json)]
 
-        self.log_audit(
-            task_id=task_id,
-            action="task_blocked",
-            agent=agent,
-            verification_status="failed",
-            payload=json.dumps({"reason": reason}),
-        )
+        self._run_coupled_queue_audit_tx(_queue_fn, now=now)
         self.sync_board()
         try:
             self._record_blocker_trap(task_id=task_id, agent=agent, reason=reason)

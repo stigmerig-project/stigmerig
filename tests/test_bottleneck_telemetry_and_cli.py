@@ -158,7 +158,7 @@ class TestCliReviewApprovalAndBackpressure(unittest.TestCase):
         code, out, err = self._run_cli(
             "task", "approve",
             "--id", "TASK-003",
-            "--verifier", "builder-1/reviewer",
+            "--verifier", "reviewer/builder-1",
         )
         self.assertEqual(code, 1)
         self.assertIn("[ERROR]", err)
@@ -172,6 +172,43 @@ class TestCliReviewApprovalAndBackpressure(unittest.TestCase):
         self.assertEqual(code, 0, err)
         db = StigmeRigDB(rig_dir=self.rig_dir)
         self.assertEqual(db.get_task("TASK-003")["status"], "done")
+
+    def test_review_bounce_self_approval_namespaced_agent(self) -> None:
+        code, out, err = self._run_cli(
+            "task", "create",
+            "--id", "TASK-004",
+            "--title", "Namespaced self approval block test",
+        )
+        self.assertEqual(code, 0, err)
+
+        code, out, err = self._run_cli("task", "claim", "--id", "TASK-004", "--agent", "claude:alpha")
+        self.assertEqual(code, 0, err)
+
+        code, out, err = self._run_cli(
+            "task", "review",
+            "--id", "TASK-004",
+            "--agent", "claude:alpha",
+            "--summary", "Awaiting independent check",
+        )
+        self.assertEqual(code, 0, err)
+
+        code, out, err = self._run_cli(
+            "task", "approve",
+            "--id", "TASK-004",
+            "--verifier", "team/claude:alpha",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("[ERROR]", err)
+        self.assertIn("Self-approval forbidden", err)
+
+        code, out, err = self._run_cli(
+            "task", "approve",
+            "--id", "TASK-004",
+            "--verifier", "claude:beta",
+        )
+        self.assertEqual(code, 0, err)
+        db = StigmeRigDB(rig_dir=self.rig_dir)
+        self.assertEqual(db.get_task("TASK-004")["status"], "done")
 
     def test_task_claim_backpressure_and_overrides(self) -> None:
         rig_json = self.rig_dir / "rig.json"
